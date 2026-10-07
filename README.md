@@ -58,7 +58,19 @@ Full reverse-engineering notes: [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 The driver lives *inside* libfprint (libfprint has no plugin system), so installing
 it means installing a patched libfprint. Two ways:
 
-### A) RPM (Fedora) — permanent, survives updates
+### Fedora 44 — download the prebuilt RPM (easiest)
+
+A ready-to-install RPM is attached to the
+[**latest release**](../../releases/latest):
+
+```bash
+sudo dnf install ./libfprint-1.94.100-2.sigfm.fc44.x86_64.rpm
+```
+
+Then `fprintd-enroll` / `fprintd-verify`, or enroll from **System Settings → Users**.
+(`Epoch: 1` keeps `dnf update` from overwriting it.)
+
+### Build the RPM yourself (Fedora)
 
 ```bash
 # build deps (one time)

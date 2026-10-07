@@ -1537,7 +1537,7 @@ index ac88ffd9..a0d41827 100644
    G_OBJECT_CLASS (fp_image_device_parent_class)->constructed (obj);
  }
 diff --git a/libfprint/fp-image.c b/libfprint/fp-image.c
-index f9c60b37..c88f45a4 100644
+index f9c60b37..9962d603 100644
 --- a/libfprint/fp-image.c
 +++ b/libfprint/fp-image.c
 @@ -448,6 +448,122 @@ fp_image_get_minutiae (FpImage *self)
@@ -1617,7 +1617,7 @@ index f9c60b37..c88f45a4 100644
 +}
 +
 +/**
-+ * fp_image_get_sigfm_info:
++ * fp_image_get_sigfm_info: (skip)
 + * @self: A #FpImage
 + *
 + * Gets the SIGFM keypoints/descriptors for an image (extract them first with
@@ -1632,7 +1632,7 @@ index f9c60b37..c88f45a4 100644
 +}
 +
 +/**
-+ * fp_image_extract_sigfm_info:
++ * fp_image_extract_sigfm_info: (skip)
 + * @self: A #FpImage
 + * @cancellable: a #GCancellable, or %NULL
 + * @callback: the function to call on completion
@@ -1664,38 +1664,19 @@ index f9c60b37..c88f45a4 100644
   * fp_image_detect_minutiae:
   * @self: A #FpImage
 diff --git a/libfprint/fp-image.h b/libfprint/fp-image.h
-index 7de9f1a4..8c759f79 100644
+index 7de9f1a4..f17ad4ce 100644
 --- a/libfprint/fp-image.h
 +++ b/libfprint/fp-image.h
-@@ -20,6 +20,7 @@
- 
- #pragma once
- 
-+#include "sigfm/sigfm.h"
- #include <gio/gio.h>
- 
- G_BEGIN_DECLS
-@@ -43,6 +44,11 @@ void          fp_image_detect_minutiae (FpImage            *self,
+@@ -43,6 +43,7 @@ void          fp_image_detect_minutiae (FpImage            *self,
                                          GCancellable       *cancellable,
                                          GAsyncReadyCallback callback,
                                          gpointer            user_data);
 +
-+void fp_image_extract_sigfm_info (FpImage           * self,
-+                                  GCancellable      * cancellable,
-+                                  GAsyncReadyCallback callback,
-+                                  gpointer            user_data);
  gboolean      fp_image_detect_minutiae_finish (FpImage      *self,
                                                 GAsyncResult *result,
                                                 GError      **error);
-@@ -56,4 +62,6 @@ void           fp_minutia_get_coords (FpMinutia *min,
-                                       gint      *x,
-                                       gint      *y);
- 
-+SigfmImgInfo * fp_image_get_sigfm_info (FpImage * self);
-+
- G_END_DECLS
 diff --git a/libfprint/fp-print.c b/libfprint/fp-print.c
-index d541437c..00acf6cd 100644
+index d541437c..b5786202 100644
 --- a/libfprint/fp-print.c
 +++ b/libfprint/fp-print.c
 @@ -20,6 +20,7 @@
@@ -1706,7 +1687,18 @@ index d541437c..00acf6cd 100644
  #include "fp-print-private.h"
  #include "fpi-compat.h"
  #include "fpi-log.h"
-@@ -682,6 +683,8 @@ fp_print_serialize (FpPrint *print,
+@@ -628,6 +629,10 @@ fp_print_equal (FpPrint *self, FpPrint *other)
+ 
+       return TRUE;
+ 
++    case FPI_PRINT_SIGFM:
++      /* SIGFM prints hold opaque SigfmImgInfo; do not treat them as equal. */
++      return FALSE;
++
+     case FPI_PRINT_UNDEFINED:
+       g_assert_not_reached ();
+     }
+@@ -682,6 +687,8 @@ fp_print_serialize (FpPrint *print,
    g_variant_builder_open (&builder, G_VARIANT_TYPE_VARDICT);
    g_variant_builder_close (&builder);
  
@@ -1715,7 +1707,7 @@ index d541437c..00acf6cd 100644
    /* Insert NBIS print data for type NBIS, otherwise the GVariant directly */
    if (print->type == FPI_PRINT_NBIS)
      {
-@@ -716,6 +719,30 @@ fp_print_serialize (FpPrint *print,
+@@ -716,6 +723,30 @@ fp_print_serialize (FpPrint *print,
        g_variant_builder_close (&nested);
        g_variant_builder_add (&builder, "v", g_variant_builder_end (&nested));
      }
@@ -1746,7 +1738,7 @@ index d541437c..00acf6cd 100644
    else
      {
        g_variant_builder_add (&builder, "v", g_variant_new_variant (print->data));
-@@ -744,6 +771,9 @@ fp_print_serialize (FpPrint *print,
+@@ -744,6 +775,9 @@ fp_print_serialize (FpPrint *print,
    g_variant_get_data (result);
    g_variant_store (result, (*data) + 3);
  
@@ -1756,7 +1748,7 @@ index d541437c..00acf6cd 100644
    return TRUE;
  }
  
-@@ -872,6 +902,41 @@ fp_print_deserialize (const guchar *data,
+@@ -872,6 +906,41 @@ fp_print_deserialize (const guchar *data,
        }
        break;
  
@@ -1799,18 +1791,19 @@ index d541437c..00acf6cd 100644
        {
          g_autoptr(GVariant) fp_data = g_variant_get_child_value (print_data, 0);
 diff --git a/libfprint/fpi-image-device.c b/libfprint/fpi-image-device.c
-index 87bdc600..5fc1f969 100644
+index 87bdc600..752528ff 100644
 --- a/libfprint/fpi-image-device.c
 +++ b/libfprint/fpi-image-device.c
-@@ -17,6 +17,7 @@
+@@ -17,6 +17,8 @@
   * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
   */
  
 +#include "fpi-print.h"
++#include "fpi-image.h"
  #define FP_COMPONENT "image_device"
  #include "fpi-log.h"
  
-@@ -253,7 +254,13 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+@@ -253,7 +255,13 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
    priv = fp_image_device_get_instance_private (FP_IMAGE_DEVICE (device));
    priv->minutiae_scan_active = FALSE;
  
@@ -1825,7 +1818,7 @@ index 87bdc600..5fc1f969 100644
      {
        /* Cancel operation . */
        if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
-@@ -282,7 +289,7 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+@@ -282,7 +290,7 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
    if (!error)
      {
        print = fp_print_new (device);
@@ -1834,7 +1827,7 @@ index 87bdc600..5fc1f969 100644
        if (!fpi_print_add_from_image (print, image, &error))
          {
            g_clear_object (&print);
-@@ -332,8 +339,14 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+@@ -332,8 +340,14 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
        for (i = 0; !error && i < templates->len; i++)
          {
            FpPrint *template = g_ptr_array_index (templates, i);
@@ -1850,7 +1843,7 @@ index 87bdc600..5fc1f969 100644
              {
                result = template;
                break;
-@@ -371,15 +384,15 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+@@ -371,15 +385,15 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
   * callback.
   */
  void
@@ -1870,7 +1863,7 @@ index 87bdc600..5fc1f969 100644
  }
  
  /**
-@@ -483,12 +496,22 @@ fpi_image_device_image_captured (FpImageDevice *self, FpImage *image)
+@@ -483,12 +497,22 @@ fpi_image_device_image_captured (FpImageDevice *self, FpImage *image)
  
    priv->minutiae_scan_active = TRUE;
  
@@ -1967,7 +1960,7 @@ index 71472dbb..d3403230 100644
  void fpi_image_device_session_error (FpImageDevice *self,
                                       GError        *error);
 diff --git a/libfprint/fpi-image.h b/libfprint/fpi-image.h
-index fdc376c8..1af88207 100644
+index fdc376c8..f516041b 100644
 --- a/libfprint/fpi-image.h
 +++ b/libfprint/fpi-image.h
 @@ -21,6 +21,7 @@
@@ -1978,7 +1971,7 @@ index fdc376c8..1af88207 100644
  
  /**
   * FpiImageFlags:
-@@ -69,6 +70,7 @@ struct _FpImage
+@@ -69,10 +70,19 @@ struct _FpImage
    guint8    *binarized;
  
    GPtrArray *minutiae;
@@ -1986,19 +1979,32 @@ index fdc376c8..1af88207 100644
  
    gboolean   detection_in_progress;
  };
+ 
++/* SIGFM feature extraction (internal; kept out of the public header so it is not
++ * picked up by GObject-Introspection). */
++void           fp_image_extract_sigfm_info (FpImage            *self,
++                                            GCancellable       *cancellable,
++                                            GAsyncReadyCallback callback,
++                                            gpointer            user_data);
++SigfmImgInfo * fp_image_get_sigfm_info (FpImage *self);
++
+ gint fpi_std_sq_dev (const guint8 *buf,
+                      gint          size);
+ gint fpi_mean_sq_diff_norm (const guint8 *buf1,
 diff --git a/libfprint/fpi-print.c b/libfprint/fpi-print.c
-index 6c5e20db..99cfc5bd 100644
+index 6c5e20db..32f11254 100644
 --- a/libfprint/fpi-print.c
 +++ b/libfprint/fpi-print.c
-@@ -21,6 +21,7 @@
+@@ -21,6 +21,8 @@
  #define FP_COMPONENT "print"
  #include "fpi-log.h"
  
 +#include "sigfm/sigfm.h"
++#include "fpi-image.h"
  #include "fp-print-private.h"
  #include "fpi-device.h"
  #include "fpi-compat.h"
-@@ -46,11 +47,19 @@
+@@ -46,11 +48,19 @@
  void
  fpi_print_add_print (FpPrint *print, FpPrint *add)
  {
@@ -2021,7 +2027,7 @@ index 6c5e20db..99cfc5bd 100644
  }
  
  /**
-@@ -71,10 +80,12 @@ fpi_print_set_type (FpPrint     *print,
+@@ -71,10 +81,12 @@ fpi_print_set_type (FpPrint     *print,
    g_return_if_fail (print->type == FPI_PRINT_UNDEFINED);
  
    print->type = type;
@@ -2036,7 +2042,7 @@ index 6c5e20db..99cfc5bd 100644
      }
    g_object_notify (G_OBJECT (print), "fpi-type");
  }
-@@ -176,7 +187,7 @@ fpi_print_add_from_image (FpPrint *print,
+@@ -176,7 +188,7 @@ fpi_print_add_from_image (FpPrint *print,
    struct fp_minutiae _minutiae;
    struct xyt_struct *xyt;
  
@@ -2045,7 +2051,7 @@ index 6c5e20db..99cfc5bd 100644
      {
        g_set_error (error,
                     G_IO_ERROR,
-@@ -185,23 +196,31 @@ fpi_print_add_from_image (FpPrint *print,
+@@ -185,23 +197,31 @@ fpi_print_add_from_image (FpPrint *print,
        return FALSE;
      }
  
@@ -2092,7 +2098,7 @@ index 6c5e20db..99cfc5bd 100644
  
    g_clear_object (&print->image);
    print->image = g_object_ref (image);
-@@ -236,7 +255,7 @@ fpi_print_bz3_match (FpPrint *print_template,
+@@ -236,7 +256,7 @@ fpi_print_bz3_match (FpPrint *print_template,
    gint i;
  
    /* XXX: Use a different error type? */
@@ -2101,7 +2107,7 @@ index 6c5e20db..99cfc5bd 100644
      {
        *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
                                           "It is only possible to match NBIS type print data");
-@@ -268,6 +287,50 @@ fpi_print_bz3_match (FpPrint *print_template,
+@@ -268,6 +288,50 @@ fpi_print_bz3_match (FpPrint *print_template,
    return FPI_MATCH_FAIL;
  }
  
