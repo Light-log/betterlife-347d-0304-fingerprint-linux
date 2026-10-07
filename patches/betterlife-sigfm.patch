@@ -1,0 +1,2830 @@
+diff --git a/libfprint/drivers/aes1610.c b/libfprint/drivers/aes1610.c
+index 91f25867..bae50b17 100644
+--- a/libfprint/drivers/aes1610.c
++++ b/libfprint/drivers/aes1610.c
+@@ -850,7 +850,7 @@ fpi_device_aes1610_class_init (FpiDeviceAes1610Class *klass)
+   img_class->activate = dev_activate;
+   img_class->deactivate = dev_deactivate;
+ 
+-  img_class->bz3_threshold = 20;
++  img_class->score_threshold = 20;
+ 
+   img_class->img_width = IMAGE_WIDTH;
+   img_class->img_height = -1;
+diff --git a/libfprint/drivers/aes1660.c b/libfprint/drivers/aes1660.c
+index 93da6967..bbd9e25a 100644
+--- a/libfprint/drivers/aes1660.c
++++ b/libfprint/drivers/aes1660.c
+@@ -80,7 +80,7 @@ fpi_device_aes1660_class_init (FpiDeviceAes1660Class *klass)
+   dev_class->id_table = id_table;
+   dev_class->scan_type = FP_SCAN_TYPE_SWIPE;
+ 
+-  img_class->bz3_threshold = 20;
++  img_class->score_threshold = 20;
+ 
+   img_class->img_width = FRAME_WIDTH + FRAME_WIDTH / 2;
+   img_class->img_height = -1;
+diff --git a/libfprint/drivers/aes2660.c b/libfprint/drivers/aes2660.c
+index fb5aa7e1..6c2c27dd 100644
+--- a/libfprint/drivers/aes2660.c
++++ b/libfprint/drivers/aes2660.c
+@@ -82,7 +82,7 @@ fpi_device_aes2660_class_init (FpiDeviceAes2660Class *klass)
+   dev_class->id_table = id_table;
+   dev_class->scan_type = FP_SCAN_TYPE_SWIPE;
+ 
+-  img_class->bz3_threshold = 20;
++  img_class->score_threshold = 20;
+ 
+   img_class->img_width = FRAME_WIDTH + FRAME_WIDTH / 2;
+   img_class->img_height = -1;
+diff --git a/libfprint/drivers/aes3k.c b/libfprint/drivers/aes3k.c
+index bab6815b..3540ae62 100644
+--- a/libfprint/drivers/aes3k.c
++++ b/libfprint/drivers/aes3k.c
+@@ -266,7 +266,7 @@ fpi_device_aes3k_class_init (FpiDeviceAes3kClass *klass)
+   img_class->deactivate = aes3k_dev_deactivate;
+ 
+   /* Extremely low due to low image quality. */
+-  img_class->bz3_threshold = 9;
++  img_class->score_threshold = 9;
+ 
+   /* Everything else is set by the subclasses. */
+ }
+diff --git a/libfprint/drivers/betterlife347d/betterlife347d-proto.c b/libfprint/drivers/betterlife347d/betterlife347d-proto.c
+new file mode 100644
+index 00000000..bec332e8
+--- /dev/null
++++ b/libfprint/drivers/betterlife347d/betterlife347d-proto.c
+@@ -0,0 +1,384 @@
++/*
++ * Betterlife 347d:0304 - secure-channel protocol helpers (framing + SM2/SM3/SM4)
++ *
++ * Copyright (C) 2026 huellero project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * Frame layout (little-endian lengths):
++ *   0xAA | len32 | nonce16 | body | crc32(reflected 0xEDB88320)
++ * where len = 16 + body_len + 4, and
++ *   body = 0x4C | cmd | sub | 0 0 0 | dlen32 | data | pad-to-16.
++ * When a session key is set, body is SM4-ECB encrypted under a per-frame key
++ *   framekey = SM4-ECB-encrypt(sesskey, nonce16).
++ * Handshake: SM2 ECDH, KDF = SM3(Sx||Sy||00000001), sess = encSess ^ KDF,
++ *   MAC = SM3(Sx||sess||Sy).
++ */
++
++#include "betterlife347d-proto.h"
++#include "sm3.h"
++#include "sm4.h"
++
++#include <string.h>
++#include <openssl/rand.h>
++#include <openssl/crypto.h>
++
++/* SM2 needs the OpenSSL 3 low-level EC API to recover the full shared point
++ * (both X and Y); EVP_PKEY_derive only exposes X. These calls are flagged
++ * deprecated-in-favour-of-EVP but remain supported. */
++#pragma GCC diagnostic push
++#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
++#include <openssl/ec.h>
++#include <openssl/bn.h>
++
++/* SM2 recommended curve parameters, GM/T 0003.5-2012 (big-endian hex).
++ * Fedora's OpenSSL does not register SM2 as a named curve, so the group is
++ * built explicitly from these. */
++#define SM2_P  "FFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000FFFFFFFFFFFFFFFF"
++#define SM2_A  "FFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF00000000FFFFFFFFFFFFFFFC"
++#define SM2_B  "28E9FA9E9D9F5E344D5A9E4BCF6509A7F39789F515AB8F92DDBCBD414D940E93"
++#define SM2_GX "32C4AE2C1F1981195F9904466A39C9948FE30BBFF2660BE1715A4589334C74C7"
++#define SM2_GY "BC3736A2F4F6779C59BDCEE36B692153D0A9877CC62A474002DF32E52139F0A0"
++#define SM2_N  "FFFFFFFEFFFFFFFFFFFFFFFFFFFFFFFF7203DF6B21C6052B53BBF40939D54123"
++
++static EC_GROUP *
++sm2_group_new (BN_CTX *ctx)
++{
++  BIGNUM *p = NULL, *a = NULL, *b = NULL, *gx = NULL, *gy = NULL, *n = NULL;
++  EC_GROUP *g = NULL;
++  EC_POINT *gen = NULL;
++
++  if (!BN_hex2bn (&p, SM2_P) || !BN_hex2bn (&a, SM2_A) || !BN_hex2bn (&b, SM2_B) ||
++      !BN_hex2bn (&gx, SM2_GX) || !BN_hex2bn (&gy, SM2_GY) || !BN_hex2bn (&n, SM2_N))
++    goto out;
++
++  g = EC_GROUP_new_curve_GFp (p, a, b, ctx);
++  if (!g)
++    goto out;
++
++  gen = EC_POINT_new (g);
++  if (!gen ||
++      EC_POINT_set_affine_coordinates (g, gen, gx, gy, ctx) != 1 ||
++      EC_GROUP_set_generator (g, gen, n, BN_value_one ()) != 1)
++    {
++      EC_GROUP_free (g);
++      g = NULL;
++    }
++
++out:
++  BN_free (p); BN_free (a); BN_free (b);
++  BN_free (gx); BN_free (gy); BN_free (n);
++  EC_POINT_free (gen);
++  return g;
++}
++
++static uint32_t
++crc32f (const uint8_t *p, gsize n)
++{
++  uint32_t c = 0xffffffffu;
++
++  for (gsize i = 0; i < n; i++)
++    {
++      c ^= p[i];
++      for (int k = 0; k < 8; k++)
++        c = (c >> 1) ^ (0xEDB88320u & -(c & 1));
++    }
++  return ~c;
++}
++
++/* SM4-ECB over nblocks 16-byte blocks (input is block-aligned, no padding).
++ * Fedora's OpenSSL is built with OPENSSL_NO_SM4, so SM4 comes from the bundled
++ * GM/T-verified implementation; OpenSSL still provides SM2 below. */
++static void
++sm4_ecb (const uint8_t key[16], const uint8_t *in, uint8_t *out, int nblocks, int enc)
++{
++  uint32_t rk[32];
++
++  sm4_key_schedule (key, rk, enc);
++  for (int i = 0; i < nblocks; i++)
++    sm4_crypt_block (rk, in + i * 16, out + i * 16);
++}
++
++gssize
++btl_frame_build (uint8_t *out, gsize cap, uint8_t cmd, uint8_t sub,
++                 const uint8_t *data, gsize dlen,
++                 const uint8_t *sesskey, const uint8_t *nonce16)
++{
++  int pad = (16 - ((dlen + 10) & 15)) & 15;
++  gsize blen = 10 + dlen + pad;             /* always a multiple of 16 */
++  gsize crcoff = 21 + blen;
++  gsize total = crcoff + 4;
++  uint8_t *body = out + 21;
++  uint32_t len, crc;
++
++  if (total > cap)
++    return -1;
++
++  out[0] = 0xAA;
++  if (sesskey)
++    {
++      if (nonce16)
++        memcpy (out + 5, nonce16, 16);
++      else if (RAND_bytes (out + 5, 16) != 1)
++        return -1;
++    }
++  else
++    {
++      memset (out + 5, 0, 16);
++    }
++
++  memset (body, 0, blen);
++  body[0] = 0x4C;
++  body[1] = cmd;
++  body[2] = sub;
++  body[6] = dlen;
++  body[7] = dlen >> 8;
++  body[8] = dlen >> 16;
++  body[9] = dlen >> 24;
++  if (data && dlen)
++    memcpy (body + 10, data, dlen);
++
++  if (sesskey)
++    {
++      uint8_t fk[16];
++      sm4_ecb (sesskey, out + 5, fk, 1, 1);
++      sm4_ecb (fk, body, body, blen / 16, 1);
++    }
++
++  len = 16 + blen + 4;
++  out[1] = len;
++  out[2] = len >> 8;
++  out[3] = len >> 16;
++  out[4] = len >> 24;
++
++  crc = crc32f (out, crcoff);
++  out[crcoff] = crc;
++  out[crcoff + 1] = crc >> 8;
++  out[crcoff + 2] = crc >> 16;
++  out[crcoff + 3] = crc >> 24;
++  return total;
++}
++
++const uint8_t *
++btl_frame_parse (uint8_t *resp, gsize rl, const uint8_t *sesskey,
++                 uint8_t *cmd, uint8_t *sub, uint32_t *dlen)
++{
++  uint32_t len;
++  gsize total, blen;
++  uint8_t *body = resp + 21;
++
++  if (rl < BTL_PAYLOAD_OFFSET || resp[0] != 0xAA)
++    return NULL;
++
++  len = resp[1] | resp[2] << 8 | resp[3] << 16 | (uint32_t) resp[4] << 24;
++  total = (gsize) len + 5;
++  if (len < 20 || total > rl)              /* len must cover nonce+crc; frame complete */
++    return NULL;
++
++  blen = len - 20;                         /* body length (nonce16 + crc4 removed) */
++  if (blen < 16 || (blen & 15))
++    return NULL;
++
++  if (sesskey)
++    {
++      uint8_t fk[16];
++      sm4_ecb (sesskey, resp + 5, fk, 1, 1);
++      sm4_ecb (fk, body, body, blen / 16, 0);
++    }
++
++  if (cmd)
++    *cmd = resp[22];
++  if (sub)
++    *sub = resp[23];
++  if (dlen)
++    *dlen = resp[27] | resp[28] << 8 | resp[29] << 16 | (uint32_t) resp[30] << 24;
++
++  return resp + BTL_PAYLOAD_OFFSET;
++}
++
++struct _BtlHandshake
++{
++  EC_GROUP *group;
++  BIGNUM   *d;
++  BN_CTX   *ctx;
++};
++
++void
++btl_handshake_free (BtlHandshake *hs)
++{
++  if (!hs)
++    return;
++  if (hs->d)
++    BN_clear_free (hs->d);
++  if (hs->group)
++    EC_GROUP_free (hs->group);
++  if (hs->ctx)
++    BN_CTX_free (hs->ctx);
++  g_free (hs);
++}
++
++BtlHandshake *
++btl_handshake_new (void)
++{
++  BtlHandshake *hs = g_new0 (BtlHandshake, 1);
++  const BIGNUM *n;
++
++  hs->ctx = BN_CTX_new ();
++  hs->group = hs->ctx ? sm2_group_new (hs->ctx) : NULL;
++  hs->d = BN_new ();
++  if (!hs->ctx || !hs->group || !hs->d)
++    goto fail;
++
++  n = EC_GROUP_get0_order (hs->group);
++  do
++    {
++      if (!BN_rand_range (hs->d, n))
++        goto fail;
++    }
++  while (BN_is_zero (hs->d));
++  return hs;
++
++fail:
++  btl_handshake_free (hs);
++  return NULL;
++}
++
++gboolean
++btl_handshake_pubkey (BtlHandshake *hs, uint8_t out65[65])
++{
++  EC_POINT *q = EC_POINT_new (hs->group);
++  BIGNUM *x = BN_new (), *y = BN_new ();
++  gboolean ok = q && x && y &&
++                EC_POINT_mul (hs->group, q, hs->d, NULL, NULL, hs->ctx) == 1 &&
++                EC_POINT_get_affine_coordinates (hs->group, q, x, y, hs->ctx) == 1;
++
++  if (ok)
++    {
++      out65[0] = 0x04;
++      BN_bn2binpad (x, out65 + 1, 32);
++      BN_bn2binpad (y, out65 + 33, 32);
++    }
++  EC_POINT_free (q);
++  BN_free (x);
++  BN_free (y);
++  return ok;
++}
++
++gboolean
++btl_handshake_derive (BtlHandshake *hs, const uint8_t *payload, gsize len,
++                      uint8_t sesskey[BTL_SESSKEY_LEN])
++{
++  gsize off = (len > 0 && payload[0] == 0x04) ? 1 : 0;
++  const uint8_t *mx_b, *my_b, *mac, *enc;
++  BIGNUM *mx = NULL, *my = NULL, *sx = BN_new (), *sy = BN_new ();
++  EC_POINT *qm = EC_POINT_new (hs->group), *s = EC_POINT_new (hs->group);
++  uint8_t sxb[32], syb[32], kd[32], sk[16], z[68], m[80], mo[32];
++  gboolean ok;
++
++  if (len < off + 64 + 32 + 16)
++    { ok = FALSE; goto out; }
++
++  mx_b = payload + off;
++  my_b = payload + off + 32;
++  mac = payload + off + 64;
++  enc = payload + off + 96;
++
++  mx = BN_bin2bn (mx_b, 32, NULL);
++  my = BN_bin2bn (my_b, 32, NULL);
++  ok = mx && my && sx && sy && qm && s &&
++       EC_POINT_set_affine_coordinates (hs->group, qm, mx, my, hs->ctx) == 1 &&
++       EC_POINT_is_on_curve (hs->group, qm, hs->ctx) == 1 &&
++       EC_POINT_mul (hs->group, s, NULL, qm, hs->d, hs->ctx) == 1 &&
++       EC_POINT_get_affine_coordinates (hs->group, s, sx, sy, hs->ctx) == 1;
++  if (!ok)
++    goto out;
++
++  BN_bn2binpad (sx, sxb, 32);
++  BN_bn2binpad (sy, syb, 32);
++
++  memcpy (z, sxb, 32);
++  memcpy (z + 32, syb, 32);
++  z[64] = 0; z[65] = 0; z[66] = 0; z[67] = 1;
++  sm3 (z, 68, kd);
++
++  for (int i = 0; i < 16; i++)
++    sk[i] = enc[i] ^ kd[i];
++
++  memcpy (m, sxb, 32);
++  memcpy (m + 32, sk, 16);
++  memcpy (m + 48, syb, 32);
++  sm3 (m, 80, mo);
++  ok = CRYPTO_memcmp (mo, mac, 32) == 0;
++  if (ok)
++    memcpy (sesskey, sk, BTL_SESSKEY_LEN);
++
++out:
++  BN_free (mx);
++  BN_free (my);
++  BN_free (sx);
++  BN_free (sy);
++  EC_POINT_free (qm);
++  EC_POINT_free (s);
++  return ok;
++}
++
++#pragma GCC diagnostic pop
++
++#ifdef BTL_PROTO_SELFTEST
++#include <stdio.h>
++#include <assert.h>
++int
++main (void)
++{
++  /* SM3("abc") GM/T 0004-2012 known-answer */
++  static const uint8_t sm3_abc[32] = {
++    0x66,0xc7,0xf0,0xf4,0x62,0xee,0xed,0xd9,0xd1,0xf2,0xd4,0x6b,0xdc,0x10,0xe4,0xe2,
++    0x41,0x67,0xc4,0x87,0x5c,0xf2,0xf7,0xa2,0x29,0x7d,0xa0,0x2b,0x8f,0x4b,0xa8,0xe0,
++  };
++  uint8_t h[32];
++  sm3 ((const uint8_t *) "abc", 3, h);
++  assert (memcmp (h, sm3_abc, 32) == 0);
++
++  /* SM4 GM/T 0002-2012 known-answer (ECB, one block) */
++  static const uint8_t k[16] = {
++    0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef,0xfe,0xdc,0xba,0x98,0x76,0x54,0x32,0x10,
++  };
++  static const uint8_t ct[16] = {
++    0x68,0x1e,0xdf,0x34,0xd2,0x06,0x96,0x5e,0x86,0xb3,0xe9,0x4f,0x53,0x6e,0x42,0x46,
++  };
++  uint8_t o[16], d[16];
++  sm4_ecb (k, k, o, 1, 1);
++  assert (memcmp (o, ct, 16) == 0);
++  sm4_ecb (k, o, d, 1, 0);
++  assert (memcmp (d, k, 16) == 0);
++
++  /* Frame round-trip: build encrypted, parse back to the same payload. */
++  uint8_t nonce[16]; for (int i = 0; i < 16; i++) nonce[i] = i * 7 + 1;
++  uint8_t data[20]; for (int i = 0; i < 20; i++) data[i] = 0xA0 + i;
++  uint8_t frame[256];
++  gssize n = btl_frame_build (frame, sizeof frame, 0xB4, 1, data, sizeof data, k, nonce);
++  assert (n > 0);
++
++  /* CRC over the pristine (still-encrypted) frame, before parse mutates it. */
++  assert (crc32f (frame, n - 4) == (uint32_t) (frame[n - 4] | frame[n - 3] << 8 |
++                                               frame[n - 2] << 16 | (uint32_t) frame[n - 1] << 24));
++
++  uint8_t cmd, sub; uint32_t dl;
++  const uint8_t *pl = btl_frame_parse (frame, n, k, &cmd, &sub, &dl);
++  assert (pl && cmd == 0xB4 && sub == 1 && dl == sizeof data);
++  assert (memcmp (pl, data, sizeof data) == 0);
++
++  /* SM2: ephemeral pubkey is a valid 0x04-prefixed on-curve point. */
++  BtlHandshake *hs = btl_handshake_new ();
++  assert (hs);
++  uint8_t pub[65];
++  assert (btl_handshake_pubkey (hs, pub) && pub[0] == 0x04);
++  btl_handshake_free (hs);
++
++  printf ("betterlife347d-proto selftest: OK\n");
++  return 0;
++}
++#endif
+diff --git a/libfprint/drivers/betterlife347d/betterlife347d-proto.h b/libfprint/drivers/betterlife347d/betterlife347d-proto.h
+new file mode 100644
+index 00000000..67e5b818
+--- /dev/null
++++ b/libfprint/drivers/betterlife347d/betterlife347d-proto.h
+@@ -0,0 +1,68 @@
++/*
++ * Betterlife 347d:0304 - secure-channel protocol helpers (framing + SM2/SM3/SM4)
++ * Transport-agnostic: no USB here. Crypto via OpenSSL 3 (SM2/SM3/SM4 native).
++ *
++ * Copyright (C) 2026 huellero project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#pragma once
++
++#include <glib.h>
++#include <stdint.h>
++
++#define BTL_SESSKEY_LEN 16
++#define BTL_NONCE_LEN   16
++#define BTL_IMG_W       96
++#define BTL_IMG_H       112
++#define BTL_IMG_SIZE    (BTL_IMG_W * BTL_IMG_H)   /* 10752, 8bpp */
++
++/* Inner payload begins at this byte offset inside a received frame:
++ *   [0]=0xAA [1..4]=len32 [5..20]=nonce16 [21]=0x4C cmd sub 0 0 0 [27..30]=dlen32 [31..]=data */
++#define BTL_PAYLOAD_OFFSET 31
++
++/* Build a framed packet into out (needs cap >= 32 + dlen + 15).
++ * sesskey == NULL => plaintext body (used for the A0/A2 handshake).
++ * nonce16 == NULL => zero nonce (only meaningful when sesskey == NULL).
++ * Returns the frame length, or -1 on overflow. */
++gssize btl_frame_build (uint8_t       *out,
++                        gsize          cap,
++                        uint8_t        cmd,
++                        uint8_t        sub,
++                        const uint8_t *data,
++                        gsize          dlen,
++                        const uint8_t *sesskey,
++                        const uint8_t *nonce16);
++
++/* Decrypt (in place) and locate the payload of a received frame.
++ * rl = total received bytes. sesskey == NULL => body is plaintext.
++ * On success returns a pointer into resp (the payload) and fills
++ * cmd, sub and dlen; returns NULL if the frame is malformed or too short. */
++const uint8_t *btl_frame_parse (uint8_t      *resp,
++                                gsize         rl,
++                                const uint8_t *sesskey,
++                                uint8_t      *cmd,
++                                uint8_t      *sub,
++                                uint32_t     *dlen);
++
++/* SM2 ephemeral key-agreement state. */
++typedef struct _BtlHandshake BtlHandshake;
++
++/* Generate an ephemeral SM2 keypair. NULL on failure. */
++BtlHandshake *btl_handshake_new (void);
++void          btl_handshake_free (BtlHandshake *hs);
++
++/* Our public key, 65 bytes: 0x04 || X(32) || Y(32). */
++gboolean      btl_handshake_pubkey (BtlHandshake *hs, uint8_t out65[65]);
++
++/* Derive the session key from the A2 response payload, which is
++ *   [0x04]? || peerX(32) || peerY(32) || MAC(32) || encSessKey(16).
++ * Verifies the MAC. Returns TRUE and fills sesskey on success. */
++gboolean      btl_handshake_derive (BtlHandshake *hs,
++                                    const uint8_t *payload,
++                                    gsize          len,
++                                    uint8_t        sesskey[BTL_SESSKEY_LEN]);
+diff --git a/libfprint/drivers/betterlife347d/betterlife347d.c b/libfprint/drivers/betterlife347d/betterlife347d.c
+new file mode 100644
+index 00000000..5f1b7efc
+--- /dev/null
++++ b/libfprint/drivers/betterlife347d/betterlife347d.c
+@@ -0,0 +1,610 @@
++/*
++ * Betterlife 347d:0304 fingerprint reader driver for libfprint
++ *
++ * Image-based (FpImageDevice) driver for the Blestech/Betterlife USB sensor
++ * found on generic (Tongfang/Clevo) barebones. The device speaks an SM2/SM3/SM4
++ * secure channel; see betterlife347d-proto.c for the framing and handshake.
++ * Capture geometry is 96x112, 8bpp. Matching is done host-side by libfprint's
++ * built-in NBIS (bozorth3) pipeline.
++ *
++ * Copyright (C) 2026 huellero project
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with this library; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#define FP_COMPONENT "betterlife347d"
++#include "fpi-log.h"
++
++#include "drivers_api.h"
++#include "betterlife347d-proto.h"
++
++#define BTL_EP_OUT (0x02 | FPI_USB_ENDPOINT_OUT)
++#define BTL_EP_IN  (0x01 | FPI_USB_ENDPOINT_IN)
++
++/* The B4/0 ack is immediate but the metadata frame that follows can take up to
++ * ~2s on hardware (device settling / finger wait). A short read timeout there
++ * leaves the metadata pending in the IN endpoint and desyncs every later read,
++ * which looked like a device "hang". Wait patiently, like the Windows driver. */
++#define BTL_TIMEOUT      4000
++#define BTL_DRAIN_TIMEOUT 120
++#define BTL_DRAIN_READS   24
++#define BTL_HS_RETRIES    8
++/* Finger detection is done by the DEVICE: after B4/0 it pushes a metadata frame
++ * (b4/0, dlen>=9) only once a finger is present, exactly like the Windows driver.
++ * So the host sends B4/0 and does a long blocking read for that metadata instead
++ * of continuously capturing images to guess - far fewer operations, which this
++ * weak bus-powered firmware needs to avoid wedging. BTL_WAIT_FINGER_MS also acts
++ * as the keepalive interval (resend B4/0 if no finger yet); no metadata for
++ * BTL_WAIT_OFF_MS means the finger has lifted. */
++#define BTL_WAIT_FINGER_MS 4000
++#define BTL_WAIT_OFF_MS    2000
++
++/* The full 96x112 image is fetched in a SINGLE B4/1 request of its byte size.
++ * Splitting it into two chunks (as the Windows driver does) made the device
++ * return garbage for the second chunk; one read returns the whole clean frame. */
++#define BTL_IMG_REQ 0x2a00     /* == BTL_IMG_SIZE (10752) */
++
++/* Image resolution in pixels/mm. mindtct needs this to size ridges; left unset
++ * (0) it extracts no usable minutiae and every match scores 0. ~500 DPI matches
++ * the observed ridge spacing (~10-12 ridges across 96 px). ponytail: tunable. */
++#define BTL_PPMM 19.685
++
++/* Receive reassembly buffer: one framed image plus header/pad/crc. */
++#define BTL_RX_CAP 16384
++
++enum open_states {
++  OPEN_DRAIN,
++  OPEN_A0_SEND,
++  OPEN_A0_READ,
++  OPEN_A2_SEND,
++  OPEN_A2_READ,
++  OPEN_DERIVE,
++  OPEN_NUM_STATES,
++};
++
++enum capture_states {
++  CAP_B4_0_SEND,
++  CAP_WAIT_META,
++  CAP_B4_1_SEND,
++  CAP_B4_1_READ,
++  CAP_SUBMIT,
++  CAP_NUM_STATES,
++};
++
++struct _FpiDeviceBetterlife347d
++{
++  FpImageDevice parent;
++
++  FpiSsm       *ssm;
++  BtlHandshake *hs;
++  guint8        sess[BTL_SESSKEY_LEN];
++  gboolean      have_session;
++
++  guint8        pub[65];
++  gint          hs_retries;
++  gint          drain_left;
++
++  guint8        tx[256];
++  guint8        rx[BTL_RX_CAP];
++  gsize         rx_got;
++  gint          rx_want_frames;
++
++  guint8        img[BTL_IMG_SIZE];
++  gsize         img_got;
++
++  gboolean      awaiting_off;
++  gboolean      deactivating;
++};
++G_DECLARE_FINAL_TYPE (FpiDeviceBetterlife347d, fpi_device_betterlife347d, FPI,
++                      DEVICE_BETTERLIFE347D, FpImageDevice);
++G_DEFINE_TYPE (FpiDeviceBetterlife347d, fpi_device_betterlife347d, FP_TYPE_IMAGE_DEVICE);
++
++/* ---- low-level send / framed-read helpers ---------------------------------- */
++
++static void
++btl_send (FpiDeviceBetterlife347d *self, FpiSsm *ssm, guint8 cmd, guint8 sub,
++          const guint8 *data, gsize dlen, const guint8 *key,
++          FpiUsbTransferCallback cb)
++{
++  FpiUsbTransfer *t;
++  gssize n = btl_frame_build (self->tx, sizeof self->tx, cmd, sub, data, dlen, key, NULL);
++
++  if (n < 0)
++    {
++      fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
++      return;
++    }
++
++  t = fpi_usb_transfer_new (FP_DEVICE (self));
++  t->ssm = ssm;
++  t->short_is_error = TRUE;
++  fpi_usb_transfer_fill_bulk_full (t, BTL_EP_OUT, self->tx, n, NULL);
++  fpi_usb_transfer_submit (t, BTL_TIMEOUT, fpi_device_get_cancellable (FP_DEVICE (self)),
++                           cb, NULL);
++}
++
++static void btl_frame_read_submit (FpiDeviceBetterlife347d *self, FpiSsm *ssm);
++
++/* Count complete 0xAA frames in buf using the plaintext length fields only
++ * (the body is encrypted, but the outer length is not). A single bulk IN
++ * transfer may carry more than one frame: the B4/0 ack and metadata often
++ * arrive coalesced, so reads must stop on a frame count, not a byte count. */
++static gint
++btl_count_frames (const guint8 *buf, gsize got)
++{
++  gsize off = 0;
++  gint n = 0;
++
++  while (off + 5 <= got)
++    {
++      guint32 len;
++      gsize flen;
++
++      if (buf[off] != 0xAA)
++        break;
++      len = buf[off + 1] | buf[off + 2] << 8 | buf[off + 3] << 16 | (guint32) buf[off + 4] << 24;
++      flen = (gsize) len + 5;
++      if (off + flen > got)
++        break;
++      off += flen;
++      n++;
++    }
++  return n;
++}
++
++static void
++btl_frame_read_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
++{
++  FpiDeviceBetterlife347d *self = FPI_DEVICE_BETTERLIFE347D (dev);
++
++  if (self->deactivating)
++    {
++      g_clear_error (&error);
++      fpi_ssm_mark_completed (transfer->ssm);
++      return;
++    }
++  if (error)
++    {
++      fpi_ssm_mark_failed (transfer->ssm, error);
++      return;
++    }
++
++  self->rx_got += transfer->actual_length;
++
++  if (btl_count_frames (self->rx, self->rx_got) >= self->rx_want_frames ||
++      transfer->actual_length == 0 ||
++      self->rx_got >= sizeof self->rx)
++    {
++      fpi_ssm_next_state (transfer->ssm);
++      return;
++    }
++
++  btl_frame_read_submit (self, transfer->ssm);
++}
++
++static void
++btl_frame_read_submit (FpiDeviceBetterlife347d *self, FpiSsm *ssm)
++{
++  FpiUsbTransfer *t = fpi_usb_transfer_new (FP_DEVICE (self));
++
++  t->ssm = ssm;
++  fpi_usb_transfer_fill_bulk_full (t, BTL_EP_IN, self->rx + self->rx_got,
++                                   sizeof self->rx - self->rx_got, NULL);
++  fpi_usb_transfer_submit (t, BTL_TIMEOUT, fpi_device_get_cancellable (FP_DEVICE (self)),
++                           btl_frame_read_cb, NULL);
++}
++
++/* Read until want_frames complete frames are buffered (see btl_count_frames). */
++static void
++btl_frame_read_start (FpiDeviceBetterlife347d *self, FpiSsm *ssm, gint want_frames)
++{
++  self->rx_got = 0;
++  self->rx_want_frames = want_frames;
++  btl_frame_read_submit (self, ssm);
++}
++
++static void btl_meta_submit (FpiDeviceBetterlife347d *self, FpiSsm *ssm);
++
++/* Finger-detect reader (Windows model): after B4/0, the device returns the ack
++ * immediately and then pushes the metadata frame WHEN A FINGER IS PRESENT. So we
++ * block-read waiting for a second frame (ack + metadata = finger present):
++ *   - two frames buffered  -> finger present: capture the image, or if we are
++ *                             waiting for lift, keep checking;
++ *   - timeout (ack only)   -> no metadata: no finger. While awaiting a finger this
++ *                             is a keepalive (resend B4/0); while awaiting lift it
++ *                             means the finger was removed, so end the cycle;
++ *   - other error          -> propagate (e.g. cancellation). */
++static void
++btl_meta_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
++{
++  FpiDeviceBetterlife347d *self = FPI_DEVICE_BETTERLIFE347D (dev);
++  FpImageDevice *idev = FP_IMAGE_DEVICE (dev);
++
++  if (self->deactivating)
++    {
++      g_clear_error (&error);
++      fpi_ssm_mark_completed (transfer->ssm);
++      return;
++    }
++  if (error)
++    {
++      if (!g_error_matches (error, G_USB_DEVICE_ERROR, G_USB_DEVICE_ERROR_TIMED_OUT))
++        {
++          fpi_ssm_mark_failed (transfer->ssm, error);
++          return;
++        }
++      g_clear_error (&error);
++      if (self->awaiting_off)
++        {
++          fpi_image_device_report_finger_status (idev, FALSE);
++          fpi_ssm_mark_completed (transfer->ssm);
++        }
++      else
++        {
++          fpi_ssm_jump_to_state (transfer->ssm, CAP_B4_0_SEND);
++        }
++      return;
++    }
++
++  self->rx_got += transfer->actual_length;
++
++  if (btl_count_frames (self->rx, self->rx_got) >= 2)
++    {
++      /* finger present */
++      fpi_ssm_jump_to_state (transfer->ssm,
++                             self->awaiting_off ? CAP_B4_0_SEND : CAP_B4_1_SEND);
++      return;
++    }
++  if (self->rx_got >= sizeof self->rx)
++    {
++      fpi_ssm_jump_to_state (transfer->ssm, CAP_B4_0_SEND);
++      return;
++    }
++  btl_meta_submit (self, transfer->ssm);
++}
++
++static void
++btl_meta_submit (FpiDeviceBetterlife347d *self, FpiSsm *ssm)
++{
++  FpiUsbTransfer *t = fpi_usb_transfer_new (FP_DEVICE (self));
++  guint timeout = self->awaiting_off ? BTL_WAIT_OFF_MS : BTL_WAIT_FINGER_MS;
++
++  t->ssm = ssm;
++  fpi_usb_transfer_fill_bulk_full (t, BTL_EP_IN, self->rx + self->rx_got,
++                                   sizeof self->rx - self->rx_got, NULL);
++  fpi_usb_transfer_submit (t, timeout, fpi_device_get_cancellable (FP_DEVICE (self)),
++                           btl_meta_cb, NULL);
++}
++
++/* Consume the frame currently in self->rx: decrypt and append its payload to
++ * the image buffer. Returns the payload length appended, or -1 on error. */
++static gssize
++btl_consume_chunk (FpiDeviceBetterlife347d *self)
++{
++  guint8 cmd, sub;
++  guint32 dlen;
++  const guint8 *pl = btl_frame_parse (self->rx, self->rx_got, self->sess, &cmd, &sub, &dlen);
++
++  if (!pl || cmd != 0xB4 || dlen == 0 || self->img_got + dlen > BTL_IMG_SIZE)
++    return -1;
++
++  memcpy (self->img + self->img_got, pl, dlen);
++  self->img_got += dlen;
++  return dlen;
++}
++
++/* ---- open: drain + SM2/SM3/SM4 handshake ----------------------------------- */
++
++static void
++btl_drain_cb (FpiUsbTransfer *transfer, FpDevice *dev, gpointer user_data, GError *error)
++{
++  FpiDeviceBetterlife347d *self = FPI_DEVICE_BETTERLIFE347D (dev);
++
++  /* Drain tolerates timeouts/short reads: the goal is only to flush any stale
++   * session bytes left in the IN endpoint before handshaking. */
++  g_clear_error (&error);
++
++  if (--self->drain_left <= 0)
++    {
++      fpi_ssm_next_state (transfer->ssm);
++      return;
++    }
++
++  FpiUsbTransfer *t = fpi_usb_transfer_new (FP_DEVICE (self));
++  t->ssm = transfer->ssm;
++  fpi_usb_transfer_fill_bulk (t, BTL_EP_IN, sizeof self->rx);
++  fpi_usb_transfer_submit (t, BTL_DRAIN_TIMEOUT,
++                           fpi_device_get_cancellable (FP_DEVICE (self)),
++                           btl_drain_cb, NULL);
++}
++
++/* A0 init payload observed on the wire before the SM2 exchange. */
++static const guint8 btl_a0_init[] = { 1, 0, 1, 1, 3, 0x11, 0 };
++
++static void
++btl_open_ssm (FpiSsm *ssm, FpDevice *dev)
++{
++  FpiDeviceBetterlife347d *self = FPI_DEVICE_BETTERLIFE347D (dev);
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case OPEN_DRAIN:
++      {
++        FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
++        self->drain_left = BTL_DRAIN_READS;
++        t->ssm = ssm;
++        fpi_usb_transfer_fill_bulk (t, BTL_EP_IN, sizeof self->rx);
++        fpi_usb_transfer_submit (t, BTL_DRAIN_TIMEOUT,
++                                 fpi_device_get_cancellable (dev), btl_drain_cb, NULL);
++        break;
++      }
++
++    case OPEN_A0_SEND:
++      btl_send (self, ssm, 0xA0, 0, btl_a0_init, sizeof btl_a0_init, NULL,
++                fpi_ssm_usb_transfer_cb);
++      break;
++
++    case OPEN_A0_READ:
++      btl_frame_read_start (self, ssm, 1);
++      break;
++
++    case OPEN_A2_SEND:
++      if (!btl_handshake_pubkey (self->hs, self->pub))
++        {
++          fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
++          break;
++        }
++      btl_send (self, ssm, 0xA2, 0, self->pub, sizeof self->pub, NULL,
++                fpi_ssm_usb_transfer_cb);
++      break;
++
++    case OPEN_A2_READ:
++      btl_frame_read_start (self, ssm, 1);
++      break;
++
++    case OPEN_DERIVE:
++      {
++        guint8 cmd, sub;
++        guint32 dlen;
++        const guint8 *pl = btl_frame_parse (self->rx, self->rx_got, NULL, &cmd, &sub, &dlen);
++
++        if (pl && dlen >= 112 &&
++            btl_handshake_derive (self->hs, pl, dlen, self->sess))
++          {
++            self->have_session = TRUE;
++            fpi_ssm_mark_completed (ssm);
++            break;
++          }
++
++        if (self->hs_retries++ < BTL_HS_RETRIES)
++          {
++            fp_dbg ("handshake attempt failed, retrying (%d)", self->hs_retries);
++            fpi_ssm_jump_to_state (ssm, OPEN_DRAIN);
++            break;
++          }
++        fpi_ssm_mark_failed (ssm, fpi_device_error_new (FP_DEVICE_ERROR_PROTO));
++        break;
++      }
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++btl_open_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
++{
++  FpiDeviceBetterlife347d *self = FPI_DEVICE_BETTERLIFE347D (dev);
++
++  self->ssm = NULL;
++  g_clear_pointer (&self->hs, btl_handshake_free);
++  fpi_image_device_open_complete (FP_IMAGE_DEVICE (dev), error);
++}
++
++static void
++btl_dev_open (FpImageDevice *dev)
++{
++  FpiDeviceBetterlife347d *self = FPI_DEVICE_BETTERLIFE347D (dev);
++  GError *error = NULL;
++
++  if (!g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (dev)),
++                                     0, 0, &error))
++    {
++      fpi_image_device_open_complete (dev, error);
++      return;
++    }
++
++  self->hs = btl_handshake_new ();
++  if (!self->hs)
++    {
++      fpi_image_device_open_complete (dev, fpi_device_error_new (FP_DEVICE_ERROR_GENERAL));
++      return;
++    }
++
++  self->have_session = FALSE;
++  self->hs_retries = 0;
++  self->ssm = fpi_ssm_new (FP_DEVICE (dev), btl_open_ssm, OPEN_NUM_STATES);
++  fpi_ssm_start (self->ssm, btl_open_complete);
++}
++
++static void
++btl_dev_close (FpImageDevice *dev)
++{
++  GError *error = NULL;
++
++  g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)), 0, 0, &error);
++  fpi_image_device_close_complete (dev, error);
++}
++
++/* ---- capture: B4 sequence + finger detection ------------------------------- */
++
++static const guint8 btl_b4_zero[4] = { 0, 0, 0, 0 };
++static const guint8 btl_b4_img[4] = { BTL_IMG_REQ & 0xff, BTL_IMG_REQ >> 8, 0, 0 };
++
++static void
++btl_submit_image (FpImageDevice *dev)
++{
++  FpiDeviceBetterlife347d *self = FPI_DEVICE_BETTERLIFE347D (dev);
++  FpImage *img = fp_image_new (BTL_IMG_W, BTL_IMG_H);
++
++  img->ppmm = BTL_PPMM;
++  memcpy (img->data, self->img, BTL_IMG_SIZE);
++  fpi_image_device_image_captured (dev, img);
++}
++
++static void
++btl_capture_ssm (FpiSsm *ssm, FpDevice *dev)
++{
++  FpiDeviceBetterlife347d *self = FPI_DEVICE_BETTERLIFE347D (dev);
++
++  if (self->deactivating)
++    {
++      fpi_ssm_mark_completed (ssm);
++      return;
++    }
++
++  switch (fpi_ssm_get_cur_state (ssm))
++    {
++    case CAP_B4_0_SEND:
++      self->img_got = 0;
++      btl_send (self, ssm, 0xB4, 0, btl_b4_zero, sizeof btl_b4_zero, self->sess,
++                fpi_ssm_usb_transfer_cb);
++      break;
++
++    case CAP_WAIT_META:
++      /* Block waiting for the device's finger-detect metadata (see btl_meta_cb);
++       * the callback drives the next transition. */
++      self->rx_got = 0;
++      btl_meta_submit (self, ssm);
++      break;
++
++    case CAP_B4_1_SEND:
++      btl_send (self, ssm, 0xB4, 1, btl_b4_img, sizeof btl_b4_img, self->sess,
++                fpi_ssm_usb_transfer_cb);
++      break;
++
++    case CAP_B4_1_READ:
++      btl_frame_read_start (self, ssm, 1);
++      break;
++
++    case CAP_SUBMIT:
++      if (btl_consume_chunk (self) < 0 || self->img_got < BTL_IMG_SIZE)
++        {
++          /* Bad/short image read: go back and wait for the finger again. */
++          fpi_ssm_jump_to_state (ssm, CAP_B4_0_SEND);
++          break;
++        }
++      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
++      btl_submit_image (FP_IMAGE_DEVICE (dev));
++      /* Now wait for the finger to lift before this cycle ends, so the next
++       * enroll stage is a distinct touch. */
++      self->awaiting_off = TRUE;
++      fpi_ssm_jump_to_state (ssm, CAP_B4_0_SEND);
++      break;
++
++    default:
++      g_assert_not_reached ();
++    }
++}
++
++static void
++btl_capture_complete (FpiSsm *ssm, FpDevice *dev, GError *error)
++{
++  FpiDeviceBetterlife347d *self = FPI_DEVICE_BETTERLIFE347D (dev);
++
++  self->ssm = NULL;
++
++  if (self->deactivating)
++    fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (dev), error);
++  else if (error)
++    fpi_image_device_session_error (FP_IMAGE_DEVICE (dev), error);
++}
++
++static void
++btl_dev_activate (FpImageDevice *dev)
++{
++  FpiDeviceBetterlife347d *self = FPI_DEVICE_BETTERLIFE347D (dev);
++
++  self->deactivating = FALSE;
++  fpi_image_device_activate_complete (dev, NULL);
++}
++
++static void
++btl_dev_change_state (FpImageDevice *dev, FpiImageDeviceState state)
++{
++  FpiDeviceBetterlife347d *self = FPI_DEVICE_BETTERLIFE347D (dev);
++
++  if (state == FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_ON)
++    {
++      self->awaiting_off = FALSE;
++      self->ssm = fpi_ssm_new (FP_DEVICE (dev), btl_capture_ssm, CAP_NUM_STATES);
++      fpi_ssm_start (self->ssm, btl_capture_complete);
++    }
++}
++
++static void
++btl_dev_deactivate (FpImageDevice *dev)
++{
++  FpiDeviceBetterlife347d *self = FPI_DEVICE_BETTERLIFE347D (dev);
++
++  self->deactivating = TRUE;
++  if (self->ssm == NULL)
++    fpi_image_device_deactivate_complete (dev, NULL);
++}
++
++/* ---- registration ---------------------------------------------------------- */
++
++static const FpIdEntry id_table[] = {
++  { .vid = 0x347d, .pid = 0x0304, },
++  { .vid = 0, .pid = 0, .driver_data = 0 },
++};
++
++static void
++fpi_device_betterlife347d_init (FpiDeviceBetterlife347d *self)
++{
++}
++
++static void
++fpi_device_betterlife347d_class_init (FpiDeviceBetterlife347dClass *klass)
++{
++  FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
++  FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS (klass);
++
++  dev_class->id = FP_COMPONENT;
++  dev_class->full_name = "Blestech Betterlife 347d:0304";
++  dev_class->type = FP_DEVICE_TYPE_USB;
++  dev_class->id_table = id_table;
++  dev_class->scan_type = FP_SCAN_TYPE_PRESS;
++  /* This driver polls the sensor continuously to detect a finger; that keeps the
++   * device "active" the whole time, which libfprint's thermal model otherwise
++   * reads as overheating and disables mid-operation. The hardware tolerates
++   * continuous polling, so declare it always-on. */
++  dev_class->temp_hot_seconds = -1;
++
++  img_class->img_width = BTL_IMG_W;
++  img_class->img_height = BTL_IMG_H;
++  /* This 96x112 sensor yields only ~4 minutiae, far too few for NBIS/bozorth3
++   * (every match scored 0). Use the SIGFM (SIFT) matcher, designed for small
++   * sensors. score_threshold is the minimum SIGFM consistent-match count.
++   * ponytail: tune on hardware from the logged "sigfm score X/Y" values. */
++  img_class->algorithm = FPI_DEVICE_ALGO_SIGFM;
++  img_class->score_threshold = 20;
++
++  img_class->img_open = btl_dev_open;
++  img_class->img_close = btl_dev_close;
++  img_class->activate = btl_dev_activate;
++  img_class->change_state = btl_dev_change_state;
++  img_class->deactivate = btl_dev_deactivate;
++}
+diff --git a/libfprint/drivers/betterlife347d/sm3.c b/libfprint/drivers/betterlife347d/sm3.c
+new file mode 100644
+index 00000000..e6311858
+--- /dev/null
++++ b/libfprint/drivers/betterlife347d/sm3.c
+@@ -0,0 +1,58 @@
++/* SM3 hash (GM/T 0004-2012). Minimal, from the standard. Self-test in main under -DSM3_TEST. */
++#include <stdint.h>
++#include <string.h>
++#include "sm3.h"
++
++static uint32_t rol(uint32_t x, int n) { return (x << n) | (x >> (32 - n)); }
++
++static void sm3_compress(uint32_t v[8], const uint8_t b[64]) {
++    uint32_t w[68], w1[64];
++    for (int i = 0; i < 16; i++)
++        w[i] = (uint32_t)b[4*i]<<24 | (uint32_t)b[4*i+1]<<16 | (uint32_t)b[4*i+2]<<8 | b[4*i+3];
++    for (int i = 16; i < 68; i++) {
++        uint32_t x = w[i-16] ^ w[i-9] ^ rol(w[i-3], 15);
++        w[i] = (x ^ rol(x, 15) ^ rol(x, 23)) ^ rol(w[i-13], 7) ^ w[i-6];
++    }
++    for (int i = 0; i < 64; i++) w1[i] = w[i] ^ w[i+4];
++    uint32_t a=v[0],bb=v[1],c=v[2],d=v[3],e=v[4],f=v[5],g=v[6],h=v[7];
++    for (int i = 0; i < 64; i++) {
++        uint32_t tj = i < 16 ? 0x79cc4519 : 0x7a879d8a;
++        uint32_t ss1 = rol(rol(a,12) + e + rol(tj, i % 32), 7);
++        uint32_t ss2 = ss1 ^ rol(a, 12);
++        uint32_t ff = i < 16 ? (a^bb^c) : ((a&bb)|(a&c)|(bb&c));
++        uint32_t gg = i < 16 ? (e^f^g) : ((e&f)|(~e&g));
++        uint32_t tt1 = ff + d + ss2 + w1[i];
++        uint32_t tt2 = gg + h + ss1 + w[i];
++        d=c; c=rol(bb,9); bb=a; a=tt1;
++        h=g; g=rol(f,19); f=e; e=tt2 ^ rol(tt2,9) ^ rol(tt2,17);
++    }
++    v[0]^=a; v[1]^=bb; v[2]^=c; v[3]^=d; v[4]^=e; v[5]^=f; v[6]^=g; v[7]^=h;
++}
++
++void sm3(const uint8_t *msg, size_t len, uint8_t out[32]) {
++    uint32_t v[8] = {0x7380166f,0x4914b2b9,0x172442d7,0xda8a0600,0xa96f30bc,0x163138aa,0xe38dee4d,0xb0fb0e4e};
++    uint8_t blk[64];
++    size_t n = len;
++    const uint8_t *p = msg;
++    while (n >= 64) { sm3_compress(v, p); p += 64; n -= 64; }
++    memset(blk, 0, 64);
++    memcpy(blk, p, n);
++    blk[n] = 0x80;
++    if (n >= 56) { sm3_compress(v, blk); memset(blk, 0, 64); }
++    uint64_t bits = (uint64_t)len * 8;
++    for (int i = 0; i < 8; i++) blk[63-i] = bits >> (8*i);
++    sm3_compress(v, blk);
++    for (int i = 0; i < 8; i++) { out[4*i]=v[i]>>24; out[4*i+1]=v[i]>>16; out[4*i+2]=v[i]>>8; out[4*i+3]=v[i]; }
++}
++
++#ifdef SM3_TEST
++#include <stdio.h>
++int main(void) {
++    uint8_t h[32];
++    sm3((const uint8_t*)"abc", 3, h);
++    const char *want = "66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0";
++    char got[65]; for (int i=0;i<32;i++) sprintf(got+2*i, "%02x", h[i]);
++    printf("SM3(abc)=%s\n%s\n", got, strcmp(got,want)?"FAIL":"PASS");
++    return strcmp(got, want) != 0;
++}
++#endif
+diff --git a/libfprint/drivers/betterlife347d/sm3.h b/libfprint/drivers/betterlife347d/sm3.h
+new file mode 100644
+index 00000000..fa1824d5
+--- /dev/null
++++ b/libfprint/drivers/betterlife347d/sm3.h
+@@ -0,0 +1,6 @@
++#ifndef SM3_H
++#define SM3_H
++#include <stddef.h>
++#include <stdint.h>
++void sm3(const uint8_t *msg, size_t len, uint8_t out[32]);
++#endif
+diff --git a/libfprint/drivers/betterlife347d/sm4.c b/libfprint/drivers/betterlife347d/sm4.c
+new file mode 100644
+index 00000000..f61af784
+--- /dev/null
++++ b/libfprint/drivers/betterlife347d/sm4.c
+@@ -0,0 +1,71 @@
++/* SM4 block cipher (GM/T 0002-2012). Self-test under -DSM4_TEST. */
++#include <stdint.h>
++#include "sm4.h"
++
++static const uint8_t S[256] = {
++0xd6,0x90,0xe9,0xfe,0xcc,0xe1,0x3d,0xb7,0x16,0xb6,0x14,0xc2,0x28,0xfb,0x2c,0x05,
++0x2b,0x67,0x9a,0x76,0x2a,0xbe,0x04,0xc3,0xaa,0x44,0x13,0x26,0x49,0x86,0x06,0x99,
++0x9c,0x42,0x50,0xf4,0x91,0xef,0x98,0x7a,0x33,0x54,0x0b,0x43,0xed,0xcf,0xac,0x62,
++0xe4,0xb3,0x1c,0xa9,0xc9,0x08,0xe8,0x95,0x80,0xdf,0x94,0xfa,0x75,0x8f,0x3f,0xa6,
++0x47,0x07,0xa7,0xfc,0xf3,0x73,0x17,0xba,0x83,0x59,0x3c,0x19,0xe6,0x85,0x4f,0xa8,
++0x68,0x6b,0x81,0xb2,0x71,0x64,0xda,0x8b,0xf8,0xeb,0x0f,0x4b,0x70,0x56,0x9d,0x35,
++0x1e,0x24,0x0e,0x5e,0x63,0x58,0xd1,0xa2,0x25,0x22,0x7c,0x3b,0x01,0x21,0x78,0x87,
++0xd4,0x00,0x46,0x57,0x9f,0xd3,0x27,0x52,0x4c,0x36,0x02,0xe7,0xa0,0xc4,0xc8,0x9e,
++0xea,0xbf,0x8a,0xd2,0x40,0xc7,0x38,0xb5,0xa3,0xf7,0xf2,0xce,0xf9,0x61,0x15,0xa1,
++0xe0,0xae,0x5d,0xa4,0x9b,0x34,0x1a,0x55,0xad,0x93,0x32,0x30,0xf5,0x8c,0xb1,0xe3,
++0x1d,0xf6,0xe2,0x2e,0x82,0x66,0xca,0x60,0xc0,0x29,0x23,0xab,0x0d,0x53,0x4e,0x6f,
++0xd5,0xdb,0x37,0x45,0xde,0xfd,0x8e,0x2f,0x03,0xff,0x6a,0x72,0x6d,0x6c,0x5b,0x51,
++0x8d,0x1b,0xaf,0x92,0xbb,0xdd,0xbc,0x7f,0x11,0xd9,0x5c,0x41,0x1f,0x10,0x5a,0xd8,
++0x0a,0xc1,0x31,0x88,0xa5,0xcd,0x7b,0xbd,0x2d,0x74,0xd0,0x12,0xb8,0xe5,0xb4,0xb0,
++0x89,0x69,0x97,0x4a,0x0c,0x96,0x77,0x7e,0x65,0xb9,0xf1,0x09,0xc5,0x6e,0xc6,0x84,
++0x18,0xf0,0x7d,0xec,0x3a,0xdc,0x4d,0x20,0x79,0xee,0x5f,0x3e,0xd7,0xcb,0x39,0x48};
++
++static const uint32_t FK[4] = {0xa3b1bac6,0x56aa3350,0x677d9197,0xb27022dc};
++static const uint32_t CK[32] = {
++0x00070e15,0x1c232a31,0x383f464d,0x545b6269,0x70777e85,0x8c939aa1,0xa8afb6bd,0xc4cbd2d9,
++0xe0e7eef5,0xfc030a11,0x181f262d,0x343b4249,0x50575e65,0x6c737a81,0x888f969d,0xa4abb2b9,
++0xc0c7ced5,0xdce3eaf1,0xf8ff060d,0x141b2229,0x30373e45,0x4c535a61,0x686f767d,0x848b9299,
++0xa0a7aeb5,0xbcc3cad1,0xd8dfe6ed,0xf4fb0209,0x10171e25,0x2c333a41,0x484f565d,0x646b7279};
++
++static uint32_t rol(uint32_t x, int n) { return (x<<n)|(x>>(32-n)); }
++static uint32_t tau(uint32_t a) {
++    return (uint32_t)S[a>>24]<<24 | (uint32_t)S[(a>>16)&0xff]<<16 | (uint32_t)S[(a>>8)&0xff]<<8 | S[a&0xff];
++}
++static uint32_t L(uint32_t b)  { return b ^ rol(b,2) ^ rol(b,10) ^ rol(b,18) ^ rol(b,24); }
++static uint32_t Lk(uint32_t b) { return b ^ rol(b,13) ^ rol(b,23); }
++static uint32_t ld(const uint8_t *p){return (uint32_t)p[0]<<24|(uint32_t)p[1]<<16|(uint32_t)p[2]<<8|p[3];}
++static void st(uint8_t *p, uint32_t v){p[0]=v>>24;p[1]=v>>16;p[2]=v>>8;p[3]=v;}
++
++void sm4_key_schedule(const uint8_t key[16], uint32_t rk[32], int encrypt) {
++    uint32_t k[4];
++    for (int i=0;i<4;i++) k[i]=ld(key+4*i)^FK[i];
++    uint32_t tmp[32];
++    for (int i=0;i<32;i++){ k[i&3]^=Lk(tau(k[(i+1)&3]^k[(i+2)&3]^k[(i+3)&3]^CK[i])); tmp[i]=k[i&3]; }
++    if (encrypt) for(int i=0;i<32;i++) rk[i]=tmp[i];
++    else for(int i=0;i<32;i++) rk[i]=tmp[31-i];
++}
++
++void sm4_crypt_block(const uint32_t rk[32], const uint8_t in[16], uint8_t out[16]) {
++    uint32_t x[4];
++    for (int i=0;i<4;i++) x[i]=ld(in+4*i);
++    for (int i=0;i<32;i++){ uint32_t t=x[0]^L(tau(x[1]^x[2]^x[3]^rk[i])); x[0]=x[1];x[1]=x[2];x[2]=x[3];x[3]=t; }
++    st(out,x[3]); st(out+4,x[2]); st(out+8,x[1]); st(out+12,x[0]);
++}
++
++#ifdef SM4_TEST
++#include <stdio.h>
++#include <string.h>
++int main(void){
++    uint8_t key[16],pt[16],ct[16],dt[16]; uint32_t ek[32],dk[32];
++    for(int i=0;i<16;i++){ key[i]=pt[i]=(i<8?(0x01+0x22*i):0); }
++    uint8_t v[16]={0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef,0xfe,0xdc,0xba,0x98,0x76,0x54,0x32,0x10};
++    memcpy(key,v,16); memcpy(pt,v,16);
++    sm4_key_schedule(key,ek,1); sm4_key_schedule(key,dk,0);
++    sm4_crypt_block(ek,pt,ct); sm4_crypt_block(dk,ct,dt);
++    const char*want="681edf34d206965e86b3e94f536e4246";
++    char g[33]; for(int i=0;i<16;i++) sprintf(g+2*i,"%02x",ct[i]);
++    printf("SM4 enc=%s\n%s\n", g, strcmp(g,want)?"FAIL-ENC":"PASS-ENC");
++    printf("roundtrip=%s\n", memcmp(pt,dt,16)?"FAIL":"PASS");
++    return strcmp(g,want)||memcmp(pt,dt,16);
++}
++#endif
+diff --git a/libfprint/drivers/betterlife347d/sm4.h b/libfprint/drivers/betterlife347d/sm4.h
+new file mode 100644
+index 00000000..da49bd7e
+--- /dev/null
++++ b/libfprint/drivers/betterlife347d/sm4.h
+@@ -0,0 +1,6 @@
++#ifndef SM4_H
++#define SM4_H
++#include <stdint.h>
++void sm4_key_schedule(const uint8_t key[16], uint32_t rk[32], int encrypt);
++void sm4_crypt_block(const uint32_t rk[32], const uint8_t in[16], uint8_t out[16]);
++#endif
+diff --git a/libfprint/drivers/egis0570.c b/libfprint/drivers/egis0570.c
+index 0ff607da..ed1f91d4 100644
+--- a/libfprint/drivers/egis0570.c
++++ b/libfprint/drivers/egis0570.c
+@@ -440,5 +440,5 @@ fpi_device_egis0570_class_init (FpDeviceEgis0570Class *klass)
+   img_class->img_width = EGIS0570_IMGWIDTH;
+   img_class->img_height = -1;
+ 
+-  img_class->bz3_threshold = EGIS0570_BZ3_THRESHOLD; /* security issue */
++  img_class->score_threshold = EGIS0570_BZ3_THRESHOLD; /* security issue */
+ }
+diff --git a/libfprint/drivers/egis0570.h b/libfprint/drivers/egis0570.h
+index 2c8f0457..619b8142 100644
+--- a/libfprint/drivers/egis0570.h
++++ b/libfprint/drivers/egis0570.h
+@@ -161,7 +161,7 @@ static unsigned char repeat_pkts[][EGIS0570_PKTSIZE] =
+ };
+ 
+ /*
+- * This sensor is small so I decided to reduce bz3_threshold from
++ * This sensor is small so I decided to reduce score_threshold from
+  * 40 to 10 to have more success to fail ratio
+  * Bozorth3 Algorithm seems not fine at the end
+  * foreget about security :))
+diff --git a/libfprint/drivers/elan.c b/libfprint/drivers/elan.c
+index f9cc52f7..0c17de5f 100644
+--- a/libfprint/drivers/elan.c
++++ b/libfprint/drivers/elan.c
+@@ -1023,5 +1023,5 @@ fpi_device_elan_class_init (FpiDeviceElanClass *klass)
+   img_class->deactivate = dev_deactivate;
+   img_class->change_state = dev_change_state;
+ 
+-  img_class->bz3_threshold = 24;
++  img_class->score_threshold = 24;
+ }
+diff --git a/libfprint/drivers/elanspi.c b/libfprint/drivers/elanspi.c
+index c2e3cbc2..dd59b011 100644
+--- a/libfprint/drivers/elanspi.c
++++ b/libfprint/drivers/elanspi.c
+@@ -1702,7 +1702,7 @@ fpi_device_elanspi_class_init (FpiDeviceElanSpiClass *klass)
+   dev_class->scan_type = FP_SCAN_TYPE_SWIPE;
+   dev_class->nr_enroll_stages = 7;       /* these sensors are very hit or miss, may as well record a few extras */
+ 
+-  img_class->bz3_threshold = 24;
++  img_class->score_threshold = 24;
+   img_class->img_open = elanspi_open;
+   img_class->activate = elanspi_activate;
+   img_class->deactivate = elanspi_deactivate;
+diff --git a/libfprint/drivers/nb1010.c b/libfprint/drivers/nb1010.c
+index 6b7755fa..5ae44c8f 100644
+--- a/libfprint/drivers/nb1010.c
++++ b/libfprint/drivers/nb1010.c
+@@ -436,7 +436,7 @@ fpi_device_nb1010_class_init (FpiDeviceNb1010Class *klass)
+   img_class->img_height = FRAME_HEIGHT;
+   img_class->img_width = FRAME_WIDTH;
+ 
+-  img_class->bz3_threshold = 24;
++  img_class->score_threshold = 24;
+ 
+   img_class->img_open = nb1010_dev_init;
+   img_class->img_close = nb1010_dev_deinit;
+diff --git a/libfprint/drivers/secugen.c b/libfprint/drivers/secugen.c
+index 37a3c17f..dd4abd64 100644
+--- a/libfprint/drivers/secugen.c
++++ b/libfprint/drivers/secugen.c
+@@ -2338,7 +2338,7 @@ fpi_device_secugen_class_init (FpiDeviceSecugenClass *klass)
+   img_class->deactivate = dev_deactivate;
+   img_class->change_state = dev_change_state;
+ 
+-  img_class->bz3_threshold = 24;
++  img_class->score_threshold = 24;
+ 
+   img_class->img_width = SECUGEN_IMG_WIDTH;
+   img_class->img_height = SECUGEN_IMG_HEIGHT;
+diff --git a/libfprint/drivers/upeksonly.c b/libfprint/drivers/upeksonly.c
+index e7ea3ce2..f4f0ca6f 100644
+--- a/libfprint/drivers/upeksonly.c
++++ b/libfprint/drivers/upeksonly.c
+@@ -1540,7 +1540,7 @@ dev_init (FpImageDevice *dev)
+       self->assembling_ctx.line_width = IMG_WIDTH_1001;
+ 
+       /* The sensor resolution is too low for the normal threshold. */
+-      fpi_image_device_set_bz3_threshold (dev, 25);
++      fpi_image_device_set_score_threshold (dev, 25);
+       break;
+ 
+     case UPEKSONLY_2016:
+diff --git a/libfprint/drivers/upektc.c b/libfprint/drivers/upektc.c
+index 3f7b6a68..46b8802a 100644
+--- a/libfprint/drivers/upektc.c
++++ b/libfprint/drivers/upektc.c
+@@ -457,7 +457,7 @@ fpi_device_upektc_class_init (FpiDeviceUpektcClass *klass)
+   img_class->activate = dev_activate;
+   img_class->deactivate = dev_deactivate;
+ 
+-  img_class->bz3_threshold = 30;
++  img_class->score_threshold = 30;
+ 
+   img_class->img_width = IMAGE_WIDTH;
+   img_class->img_height = IMAGE_HEIGHT;
+diff --git a/libfprint/drivers/upektc_img.c b/libfprint/drivers/upektc_img.c
+index c8ca21f6..8becffb1 100644
+--- a/libfprint/drivers/upektc_img.c
++++ b/libfprint/drivers/upektc_img.c
+@@ -797,7 +797,7 @@ fpi_device_upektc_img_class_init (FpiDeviceUpektcImgClass *klass)
+   img_class->activate = dev_activate;
+   img_class->deactivate = dev_deactivate;
+ 
+-  img_class->bz3_threshold = 20;
++  img_class->score_threshold = 20;
+ 
+   img_class->img_width = -1;
+   img_class->img_height = -1;
+diff --git a/libfprint/drivers/vfs0050.c b/libfprint/drivers/vfs0050.c
+index ca2eda9c..06db2914 100644
+--- a/libfprint/drivers/vfs0050.c
++++ b/libfprint/drivers/vfs0050.c
+@@ -766,7 +766,7 @@ fpi_device_vfs0050_class_init (FpDeviceVfs0050Class *klass)
+   img_class->activate = dev_activate;
+   img_class->deactivate = dev_deactivate;
+ 
+-  img_class->bz3_threshold = 24;
++  img_class->score_threshold = 24;
+ 
+   img_class->img_width = VFS_IMAGE_WIDTH;
+   img_class->img_height = -1;
+diff --git a/libfprint/drivers/vfs101.c b/libfprint/drivers/vfs101.c
+index ca77901a..56cfe000 100644
+--- a/libfprint/drivers/vfs101.c
++++ b/libfprint/drivers/vfs101.c
+@@ -1366,7 +1366,7 @@ fpi_device_vfs101_class_init (FpDeviceVfs101Class *klass)
+   img_class->activate = dev_activate;
+   img_class->deactivate = dev_deactivate;
+ 
+-  img_class->bz3_threshold = 24;
++  img_class->score_threshold = 24;
+ 
+   img_class->img_width = VFS_IMG_WIDTH;
+   img_class->img_height = -1;
+diff --git a/libfprint/drivers/vfs301.c b/libfprint/drivers/vfs301.c
+index 9b162ee9..8d7adfec 100644
+--- a/libfprint/drivers/vfs301.c
++++ b/libfprint/drivers/vfs301.c
+@@ -274,7 +274,7 @@ fpi_device_vfs301_class_init (FpDeviceVfs301Class *klass)
+   img_class->deactivate = dev_deactivate;
+   img_class->change_state = dev_change_state;
+ 
+-  img_class->bz3_threshold = 24;
++  img_class->score_threshold = 24;
+ 
+   img_class->img_width = VFS301_FP_WIDTH;
+   img_class->img_height = -1;
+diff --git a/libfprint/drivers/vfs5011.c b/libfprint/drivers/vfs5011.c
+index b9e0587b..6377b886 100644
+--- a/libfprint/drivers/vfs5011.c
++++ b/libfprint/drivers/vfs5011.c
+@@ -894,7 +894,7 @@ fpi_device_vfs5011_class_init (FpDeviceVfs5011Class *klass)
+   img_class->activate = dev_activate;
+   img_class->deactivate = dev_deactivate;
+ 
+-  img_class->bz3_threshold = 20;
++  img_class->score_threshold = 20;
+ 
+   img_class->img_width = VFS5011_IMAGE_WIDTH;
+   img_class->img_height = -1;
+diff --git a/libfprint/drivers/vfs7552.c b/libfprint/drivers/vfs7552.c
+index 53b4d3f3..0fb8d11b 100644
+--- a/libfprint/drivers/vfs7552.c
++++ b/libfprint/drivers/vfs7552.c
+@@ -1065,7 +1065,7 @@ fpi_device_vfs7552_class_init (FpDeviceVfs7552Class *klass)
+   img_class->activate = dev_activate;
+   img_class->img_open = dev_open;
+ 
+-  img_class->bz3_threshold = 20;
++  img_class->score_threshold = 20;
+ 
+   img_class->img_width = VFS7552_IMAGE_WIDTH;
+   img_class->img_height = VFS7552_IMAGE_HEIGHT;
+diff --git a/libfprint/fp-image-device-private.h b/libfprint/fp-image-device-private.h
+index b075634a..0b2e205c 100644
+--- a/libfprint/fp-image-device-private.h
++++ b/libfprint/fp-image-device-private.h
+@@ -36,7 +36,8 @@ typedef struct
+   GError             *action_error;
+   FpImage            *capture_image;
+ 
+-  gint                bz3_threshold;
++  gint                score_threshold;
++  FpiPrintType        algorithm;
+ } FpImageDevicePrivate;
+ 
+ 
+diff --git a/libfprint/fp-image-device.c b/libfprint/fp-image-device.c
+index ac88ffd9..a0d41827 100644
+--- a/libfprint/fp-image-device.c
++++ b/libfprint/fp-image-device.c
+@@ -17,6 +17,7 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include "fpi-print.h"
+ #define FP_COMPONENT "image_device"
+ #include "fpi-log.h"
+ 
+@@ -100,7 +101,6 @@ fp_image_device_start_capture_action (FpDevice *device)
+   FpImageDevice *self = FP_IMAGE_DEVICE (device);
+   FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
+   FpiDeviceAction action;
+-  FpiPrintType print_type;
+ 
+   /* There is just one action that we cannot support out
+    * of the box, which is a capture without first waiting
+@@ -124,9 +124,10 @@ fp_image_device_start_capture_action (FpDevice *device)
+       FpPrint *enroll_print = NULL;
+ 
+       fpi_device_get_enroll_data (device, &enroll_print);
++      FpiPrintType print_type;
+       g_object_get (enroll_print, "fpi-type", &print_type, NULL);
+-      if (print_type != FPI_PRINT_NBIS)
+-        fpi_print_set_type (enroll_print, FPI_PRINT_NBIS);
++      if (print_type != priv->algorithm)
++        fpi_print_set_type (enroll_print, priv->algorithm);
+     }
+ 
+   priv->enroll_stage = 0;
+@@ -193,9 +194,12 @@ fp_image_device_constructed (GObject *obj)
+   FpImageDeviceClass *cls = FP_IMAGE_DEVICE_GET_CLASS (self);
+ 
+   /* Set default threshold. */
+-  priv->bz3_threshold = BOZORTH3_DEFAULT_THRESHOLD;
+-  if (cls->bz3_threshold > 0)
+-    priv->bz3_threshold = cls->bz3_threshold;
++  priv->score_threshold = BOZORTH3_DEFAULT_THRESHOLD;
++  if (cls->score_threshold > 0)
++    priv->score_threshold = cls->score_threshold;
++  priv->algorithm = FPI_PRINT_NBIS;
++  if (cls->algorithm > 0)
++    priv->algorithm = (FpiPrintType) cls->algorithm;
+ 
+   G_OBJECT_CLASS (fp_image_device_parent_class)->constructed (obj);
+ }
+diff --git a/libfprint/fp-image.c b/libfprint/fp-image.c
+index f9c60b37..c88f45a4 100644
+--- a/libfprint/fp-image.c
++++ b/libfprint/fp-image.c
+@@ -448,6 +448,122 @@ fp_image_get_minutiae (FpImage *self)
+   return self->minutiae;
+ }
+ 
++/* ---- SIGFM (SIFT-based) feature extraction, for small sensors ---- */
++
++typedef struct
++{
++  SigfmImgInfo       *sigfm_info;
++  guchar             *image;
++  gint                width;
++  gint                height;
++  GAsyncReadyCallback user_cb;
++} ExtractSigfmData;
++
++static void
++fp_image_sigfm_extract_free (ExtractSigfmData *data)
++{
++  g_clear_pointer (&data->image, g_free);
++  g_clear_pointer (&data->sigfm_info, sigfm_free_info);
++  g_free (data);
++}
++
++static void
++fp_image_sigfm_extract_cb (GObject *source_object, GAsyncResult *res,
++                           gpointer user_data)
++{
++  GTask *task = G_TASK (res);
++  FpImage *image;
++  ExtractSigfmData *data = g_task_get_task_data (task);
++
++  if (!g_task_had_error (task))
++    {
++      image = FP_IMAGE (source_object);
++
++      g_clear_pointer (&image->data, g_free);
++      image->data = g_steal_pointer (&data->image);
++      image->sigfm_info = g_steal_pointer (&data->sigfm_info);
++    }
++
++  if (data->user_cb)
++    data->user_cb (source_object, res, user_data);
++}
++
++static void
++fp_image_sigfm_extract_thread_func (GTask *task, gpointer src_obj,
++                                    gpointer task_data,
++                                    GCancellable *cancellable)
++{
++  ExtractSigfmData *data = task_data;
++  GTimer *timer = g_timer_new ();
++
++  data->sigfm_info = sigfm_extract (data->image, data->width, data->height);
++  g_timer_stop (timer);
++  fp_dbg ("sigfm extract completed in %f secs", g_timer_elapsed (timer, NULL));
++  g_timer_destroy (timer);
++
++  if (!data->sigfm_info)
++    {
++      fp_err ("extract sigfm info failed");
++      g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED, "SIGFM scan failed");
++      g_object_unref (task);
++      return;
++    }
++
++  if (sigfm_keypoints_count (data->sigfm_info) < 25)
++    {
++      g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED,
++                               "Not enough keypoints found");
++      g_object_unref (task);
++      return;
++    }
++  g_task_return_boolean (task, TRUE);
++  g_object_unref (task);
++}
++
++/**
++ * fp_image_get_sigfm_info:
++ * @self: A #FpImage
++ *
++ * Gets the SIGFM keypoints/descriptors for an image (extract them first with
++ * fp_image_extract_sigfm_info()). Must not be modified or freed.
++ *
++ * Returns: (transfer none): the SIGFM info, or %NULL
++ */
++SigfmImgInfo *
++fp_image_get_sigfm_info (FpImage *self)
++{
++  return self->sigfm_info;
++}
++
++/**
++ * fp_image_extract_sigfm_info:
++ * @self: A #FpImage
++ * @cancellable: a #GCancellable, or %NULL
++ * @callback: the function to call on completion
++ * @user_data: the data to pass to @callback
++ *
++ * Extracts SIGFM (SIFT) keypoints and descriptors from an image.
++ */
++void
++fp_image_extract_sigfm_info (FpImage *self, GCancellable *cancellable,
++                             GAsyncReadyCallback callback, gpointer user_data)
++{
++  GTask *task;
++  ExtractSigfmData *data = g_new0 (ExtractSigfmData, 1);
++
++  task = g_task_new (self, cancellable, fp_image_sigfm_extract_cb, user_data);
++
++  data->image = g_malloc (self->width * self->height);
++  memcpy (data->image, self->data, self->width * self->height);
++  data->width = self->width;
++  data->height = self->height;
++  data->user_cb = callback;
++
++  g_task_set_task_data (task, data,
++                        (GDestroyNotify) fp_image_sigfm_extract_free);
++  g_task_run_in_thread (task, fp_image_sigfm_extract_thread_func);
++}
++
+ /**
+  * fp_image_detect_minutiae:
+  * @self: A #FpImage
+diff --git a/libfprint/fp-image.h b/libfprint/fp-image.h
+index 7de9f1a4..8c759f79 100644
+--- a/libfprint/fp-image.h
++++ b/libfprint/fp-image.h
+@@ -20,6 +20,7 @@
+ 
+ #pragma once
+ 
++#include "sigfm/sigfm.h"
+ #include <gio/gio.h>
+ 
+ G_BEGIN_DECLS
+@@ -43,6 +44,11 @@ void          fp_image_detect_minutiae (FpImage            *self,
+                                         GCancellable       *cancellable,
+                                         GAsyncReadyCallback callback,
+                                         gpointer            user_data);
++
++void fp_image_extract_sigfm_info (FpImage           * self,
++                                  GCancellable      * cancellable,
++                                  GAsyncReadyCallback callback,
++                                  gpointer            user_data);
+ gboolean      fp_image_detect_minutiae_finish (FpImage      *self,
+                                                GAsyncResult *result,
+                                                GError      **error);
+@@ -56,4 +62,6 @@ void           fp_minutia_get_coords (FpMinutia *min,
+                                       gint      *x,
+                                       gint      *y);
+ 
++SigfmImgInfo * fp_image_get_sigfm_info (FpImage * self);
++
+ G_END_DECLS
+diff --git a/libfprint/fp-print.c b/libfprint/fp-print.c
+index d541437c..00acf6cd 100644
+--- a/libfprint/fp-print.c
++++ b/libfprint/fp-print.c
+@@ -20,6 +20,7 @@
+ 
+ #define FP_COMPONENT "print"
+ 
++#include "sigfm/sigfm.h"
+ #include "fp-print-private.h"
+ #include "fpi-compat.h"
+ #include "fpi-log.h"
+@@ -682,6 +683,8 @@ fp_print_serialize (FpPrint *print,
+   g_variant_builder_open (&builder, G_VARIANT_TYPE_VARDICT);
+   g_variant_builder_close (&builder);
+ 
++  GPtrArray *to_free = NULL;
++
+   /* Insert NBIS print data for type NBIS, otherwise the GVariant directly */
+   if (print->type == FPI_PRINT_NBIS)
+     {
+@@ -716,6 +719,30 @@ fp_print_serialize (FpPrint *print,
+       g_variant_builder_close (&nested);
+       g_variant_builder_add (&builder, "v", g_variant_builder_end (&nested));
+     }
++  else if (print->type == FPI_PRINT_SIGFM)
++    {
++      GVariantBuilder nested = G_VARIANT_BUILDER_INIT (G_VARIANT_TYPE ("(a(ay))"));
++      guint i;
++
++      to_free = g_ptr_array_new ();
++      g_ptr_array_set_free_func (to_free, free);
++      g_variant_builder_open (&nested, G_VARIANT_TYPE ("a(ay)"));
++      for (i = 0; i < print->prints->len; i++)
++        {
++          SigfmImgInfo *info = g_ptr_array_index (print->prints, i);
++          int slen = 0;
++          unsigned char *serialized = sigfm_serialize_binary (info, &slen);
++
++          g_variant_builder_open (&nested, G_VARIANT_TYPE ("(ay)"));
++          g_variant_builder_add_value (&nested,
++                                       g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE,
++                                                                  serialized, slen, 1));
++          g_ptr_array_add (to_free, serialized);
++          g_variant_builder_close (&nested);
++        }
++      g_variant_builder_close (&nested);
++      g_variant_builder_add (&builder, "v", g_variant_builder_end (&nested));
++    }
+   else
+     {
+       g_variant_builder_add (&builder, "v", g_variant_new_variant (print->data));
+@@ -744,6 +771,9 @@ fp_print_serialize (FpPrint *print,
+   g_variant_get_data (result);
+   g_variant_store (result, (*data) + 3);
+ 
++  if (to_free != NULL)
++    g_ptr_array_free (to_free, TRUE);
++
+   return TRUE;
+ }
+ 
+@@ -872,6 +902,41 @@ fp_print_deserialize (const guchar *data,
+       }
+       break;
+ 
++    case FPI_PRINT_SIGFM:
++      {
++        g_autoptr(GVariant) prints = g_variant_get_child_value (print_data, 0);
++        guint i;
++
++        result = g_object_new (FP_TYPE_PRINT,
++                               "driver", driver,
++                               "device-id", device_id,
++                               "device-stored", device_stored,
++                               NULL);
++        g_object_ref_sink (result);
++        fpi_print_set_type (result, FPI_PRINT_SIGFM);
++
++        for (i = 0; i < g_variant_n_children (prints); i++)
++          {
++            g_autoptr(GVariant) sigfm_data = NULL;
++            GVariant *child;
++            gsize slen;
++            const unsigned char *serialized;
++            SigfmImgInfo *sigfm_info;
++
++            sigfm_data = g_variant_get_child_value (prints, i);
++            child = g_variant_get_child_value (sigfm_data, 0);
++            serialized = g_variant_get_fixed_array (child, &slen, sizeof (unsigned char));
++
++            sigfm_info = sigfm_deserialize_binary (serialized, slen);
++            g_variant_unref (child);
++            if (!sigfm_info)
++              goto invalid_format;
++
++            g_ptr_array_add (result->prints, g_steal_pointer (&sigfm_info));
++          }
++      }
++      break;
++
+     case FPI_PRINT_RAW:
+       {
+         g_autoptr(GVariant) fp_data = g_variant_get_child_value (print_data, 0);
+diff --git a/libfprint/fpi-image-device.c b/libfprint/fpi-image-device.c
+index 87bdc600..5fc1f969 100644
+--- a/libfprint/fpi-image-device.c
++++ b/libfprint/fpi-image-device.c
+@@ -17,6 +17,7 @@
+  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+  */
+ 
++#include "fpi-print.h"
+ #define FP_COMPONENT "image_device"
+ #include "fpi-log.h"
+ 
+@@ -253,7 +254,13 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+   priv = fp_image_device_get_instance_private (FP_IMAGE_DEVICE (device));
+   priv->minutiae_scan_active = FALSE;
+ 
+-  if (!fp_image_detect_minutiae_finish (image, res, &error))
++  gboolean scan_ok;
++  if (priv->algorithm == FPI_PRINT_SIGFM)
++    scan_ok = g_task_propagate_boolean (G_TASK (res), &error);
++  else
++    scan_ok = fp_image_detect_minutiae_finish (image, res, &error);
++
++  if (!scan_ok)
+     {
+       /* Cancel operation . */
+       if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+@@ -282,7 +289,7 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+   if (!error)
+     {
+       print = fp_print_new (device);
+-      fpi_print_set_type (print, FPI_PRINT_NBIS);
++      fpi_print_set_type (print, priv->algorithm);
+       if (!fpi_print_add_from_image (print, image, &error))
+         {
+           g_clear_object (&print);
+@@ -332,8 +339,14 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+       for (i = 0; !error && i < templates->len; i++)
+         {
+           FpPrint *template = g_ptr_array_index (templates, i);
++          FpiMatchResult mres = FPI_MATCH_ERROR;
+ 
+-          if (fpi_print_bz3_match (template, print, priv->bz3_threshold, &error) == FPI_MATCH_SUCCESS)
++          if (priv->algorithm == FPI_PRINT_SIGFM)
++            mres = fpi_print_sigfm_match (template, print, priv->score_threshold, &error);
++          else
++            mres = fpi_print_bz3_match (template, print, priv->score_threshold, &error);
++
++          if (mres == FPI_MATCH_SUCCESS)
+             {
+               result = template;
+               break;
+@@ -371,15 +384,15 @@ fpi_image_device_minutiae_detected (GObject *source_object, GAsyncResult *res, g
+  * callback.
+  */
+ void
+-fpi_image_device_set_bz3_threshold (FpImageDevice *self,
+-                                    gint           bz3_threshold)
++fpi_image_device_set_score_threshold (FpImageDevice *self,
++                                      gint           score_threshold)
+ {
+   FpImageDevicePrivate *priv = fp_image_device_get_instance_private (self);
+ 
+   g_return_if_fail (FP_IS_IMAGE_DEVICE (self));
+-  g_return_if_fail (bz3_threshold > 0);
++  g_return_if_fail (score_threshold > 0);
+ 
+-  priv->bz3_threshold = bz3_threshold;
++  priv->score_threshold = score_threshold;
+ }
+ 
+ /**
+@@ -483,12 +496,22 @@ fpi_image_device_image_captured (FpImageDevice *self, FpImage *image)
+ 
+   priv->minutiae_scan_active = TRUE;
+ 
+-  /* XXX: We also detect minutiae in capture mode, we solely do this
+-   *      to normalize the image which will happen as a by-product. */
+-  fp_image_detect_minutiae (image,
+-                            fpi_device_get_cancellable (FP_DEVICE (self)),
+-                            fpi_image_device_minutiae_detected,
+-                            self);
++  if (priv->algorithm == FPI_PRINT_SIGFM)
++    {
++      fp_image_extract_sigfm_info (image,
++                                   fpi_device_get_cancellable (FP_DEVICE (self)),
++                                   fpi_image_device_minutiae_detected,
++                                   self);
++    }
++  else
++    {
++      /* XXX: We also detect minutiae in capture mode, we solely do this
++       *      to normalize the image which will happen as a by-product. */
++      fp_image_detect_minutiae (image,
++                                fpi_device_get_cancellable (FP_DEVICE (self)),
++                                fpi_image_device_minutiae_detected,
++                                self);
++    }
+ 
+   /* XXX: This is wrong if we add support for raw capture mode. */
+   fp_image_device_change_state (self, FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF);
+diff --git a/libfprint/fpi-image-device.h b/libfprint/fpi-image-device.h
+index 71472dbb..d3403230 100644
+--- a/libfprint/fpi-image-device.h
++++ b/libfprint/fpi-image-device.h
+@@ -19,8 +19,9 @@
+ 
+ #pragma once
+ 
+-#include "fpi-device.h"
+ #include "fp-image-device.h"
++#include "fpi-device.h"
++#include "fpi-print.h"
+ 
+ /**
+  * FpiImageDeviceState:
+@@ -70,9 +71,14 @@ typedef enum {
+   FPI_IMAGE_DEVICE_STATE_AWAIT_FINGER_OFF,
+ } FpiImageDeviceState;
+ 
++typedef enum {
++  FPI_DEVICE_ALGO_NBIS = FPI_PRINT_NBIS,
++  FPI_DEVICE_ALGO_SIGFM = FPI_PRINT_SIGFM,
++} FpiImageDeviceAlgorithm;
++
+ /**
+  * FpImageDeviceClass:
+- * @bz3_threshold: Threshold to consider bozorth3 score a match, default: 40
++ * @score_threshold: Threshold to consider bozorth3 score a match, default: 40
+  * @img_width: Width of the image, only provide if constant
+  * @img_height: Height of the image, only provide if constant
+  * @img_open: Open the device and do basic initialization
+@@ -102,22 +108,23 @@ typedef enum {
+  */
+ struct _FpImageDeviceClass
+ {
+-  FpDeviceClass parent_class;
++  FpDeviceClass           parent_class;
+ 
+-  gint          bz3_threshold;
+-  gint          img_width;
+-  gint          img_height;
++  gint                    score_threshold;
++  gint                    img_width;
++  gint                    img_height;
++  FpiImageDeviceAlgorithm algorithm;
+ 
+-  void          (*img_open)     (FpImageDevice *dev);
+-  void          (*img_close)    (FpImageDevice *dev);
+-  void          (*activate)     (FpImageDevice *dev);
+-  void          (*change_state) (FpImageDevice      *dev,
+-                                 FpiImageDeviceState state);
+-  void          (*deactivate)   (FpImageDevice *dev);
++  void                    (*img_open)     (FpImageDevice *dev);
++  void                    (*img_close)    (FpImageDevice *dev);
++  void                    (*activate)     (FpImageDevice *dev);
++  void                    (*change_state) (FpImageDevice      *dev,
++                                           FpiImageDeviceState state);
++  void                    (*deactivate)   (FpImageDevice *dev);
+ };
+ 
+-void fpi_image_device_set_bz3_threshold (FpImageDevice *self,
+-                                         gint           bz3_threshold);
++void fpi_image_device_set_score_threshold (FpImageDevice *self,
++                                           gint           score_threshold);
+ 
+ void fpi_image_device_session_error (FpImageDevice *self,
+                                      GError        *error);
+diff --git a/libfprint/fpi-image.h b/libfprint/fpi-image.h
+index fdc376c8..1af88207 100644
+--- a/libfprint/fpi-image.h
++++ b/libfprint/fpi-image.h
+@@ -21,6 +21,7 @@
+ #pragma once
+ 
+ #include "fp-image.h"
++#include "sigfm/sigfm.h"
+ 
+ /**
+  * FpiImageFlags:
+@@ -69,6 +70,7 @@ struct _FpImage
+   guint8    *binarized;
+ 
+   GPtrArray *minutiae;
++  SigfmImgInfo *sigfm_info;
+ 
+   gboolean   detection_in_progress;
+ };
+diff --git a/libfprint/fpi-print.c b/libfprint/fpi-print.c
+index 6c5e20db..99cfc5bd 100644
+--- a/libfprint/fpi-print.c
++++ b/libfprint/fpi-print.c
+@@ -21,6 +21,7 @@
+ #define FP_COMPONENT "print"
+ #include "fpi-log.h"
+ 
++#include "sigfm/sigfm.h"
+ #include "fp-print-private.h"
+ #include "fpi-device.h"
+ #include "fpi-compat.h"
+@@ -46,11 +47,19 @@
+ void
+ fpi_print_add_print (FpPrint *print, FpPrint *add)
+ {
+-  g_return_if_fail (print->type == FPI_PRINT_NBIS);
+-  g_return_if_fail (add->type == FPI_PRINT_NBIS);
++  g_return_if_fail (print->type == FPI_PRINT_NBIS ||
++                    print->type == FPI_PRINT_SIGFM);
++  g_return_if_fail (add->type == FPI_PRINT_NBIS ||
++                    add->type == FPI_PRINT_SIGFM);
++  g_return_if_fail (add->type == print->type);
++  g_return_if_fail (add->prints->len > 0);
+ 
+   g_assert (add->prints->len == 1);
+-  g_ptr_array_add (print->prints, g_memdup2 (add->prints->pdata[0], sizeof (struct xyt_struct)));
++  void *to_add =
++    print->type == FPI_PRINT_NBIS ?
++    g_memdup2 (add->prints->pdata[0], sizeof (struct xyt_struct)) :
++    (void *) sigfm_copy_info (add->prints->pdata[0]);
++  g_ptr_array_add (print->prints, to_add);
+ }
+ 
+ /**
+@@ -71,10 +80,12 @@ fpi_print_set_type (FpPrint     *print,
+   g_return_if_fail (print->type == FPI_PRINT_UNDEFINED);
+ 
+   print->type = type;
+-  if (print->type == FPI_PRINT_NBIS)
++  if (print->type == FPI_PRINT_NBIS || print->type == FPI_PRINT_SIGFM)
+     {
+       g_assert_null (print->prints);
+-      print->prints = g_ptr_array_new_with_free_func (g_free);
++      print->prints = g_ptr_array_new_with_free_func (
++        print->type == FPI_PRINT_NBIS ? g_free :
++        (void (*)(void *)) (sigfm_free_info));
+     }
+   g_object_notify (G_OBJECT (print), "fpi-type");
+ }
+@@ -176,7 +187,7 @@ fpi_print_add_from_image (FpPrint *print,
+   struct fp_minutiae _minutiae;
+   struct xyt_struct *xyt;
+ 
+-  if (print->type != FPI_PRINT_NBIS || !image)
++  if ((print->type != FPI_PRINT_NBIS && print->type != FPI_PRINT_SIGFM) || !image)
+     {
+       g_set_error (error,
+                    G_IO_ERROR,
+@@ -185,23 +196,31 @@ fpi_print_add_from_image (FpPrint *print,
+       return FALSE;
+     }
+ 
+-  minutiae = fp_image_get_minutiae (image);
+-  if (!minutiae || minutiae->len == 0)
++  if (print->type == FPI_PRINT_NBIS)
+     {
+-      g_set_error (error,
+-                   G_IO_ERROR,
+-                   G_IO_ERROR_INVALID_DATA,
+-                   "No minutiae found in image or not yet detected!");
+-      return FALSE;
++      minutiae = fp_image_get_minutiae (image);
++      if (!minutiae || minutiae->len == 0)
++        {
++          g_set_error (error,
++                       G_IO_ERROR,
++                       G_IO_ERROR_INVALID_DATA,
++                       "No minutiae found in image or not yet detected!");
++          return FALSE;
++        }
++
++      _minutiae.num = minutiae->len;
++      _minutiae.list = (struct fp_minutia **) minutiae->pdata;
++      _minutiae.alloc = minutiae->len;
++
++      xyt = g_new0 (struct xyt_struct, 1);
++      minutiae_to_xyt (&_minutiae, image->width, image->height, xyt);
++      g_ptr_array_add (print->prints, xyt);
++    }
++  else if (print->type == FPI_PRINT_SIGFM)
++    {
++      SigfmImgInfo *info = fp_image_get_sigfm_info (image);
++      g_ptr_array_add (print->prints, info);
+     }
+-
+-  _minutiae.num = minutiae->len;
+-  _minutiae.list = (struct fp_minutia **) minutiae->pdata;
+-  _minutiae.alloc = minutiae->len;
+-
+-  xyt = g_new0 (struct xyt_struct, 1);
+-  minutiae_to_xyt (&_minutiae, image->width, image->height, xyt);
+-  g_ptr_array_add (print->prints, xyt);
+ 
+   g_clear_object (&print->image);
+   print->image = g_object_ref (image);
+@@ -236,7 +255,7 @@ fpi_print_bz3_match (FpPrint *print_template,
+   gint i;
+ 
+   /* XXX: Use a different error type? */
+-  if (print_template->type != FPI_PRINT_NBIS || print->type != FPI_PRINT_NBIS)
++  if (print_template->type != FPI_PRINT_NBIS)
+     {
+       *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
+                                          "It is only possible to match NBIS type print data");
+@@ -268,6 +287,50 @@ fpi_print_bz3_match (FpPrint *print_template,
+   return FPI_MATCH_FAIL;
+ }
+ 
++/**
++ * fpi_print_sigfm_match:
++ * @print_template: A #FpPrint containing one or more prints
++ * @print: A newly scanned #FpPrint to test
++ * @score_threshold: The SIGFM match threshold
++ * @error: Return location for error
++ *
++ * Match the newly scanned @print against the prints contained in
++ * @print_template (stored during enrollment) using the SIGFM (SIFT) matcher.
++ *
++ * Returns: Whether the prints match, @error will be set if #FPI_MATCH_ERROR is returned
++ */
++FpiMatchResult
++fpi_print_sigfm_match (FpPrint *print_template,
++                       FpPrint *print,
++                       gint     score_threshold,
++                       GError **error)
++{
++  if (print_template->type != FPI_PRINT_SIGFM)
++    {
++      *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_NOT_SUPPORTED,
++                                         "Cannot call sigfm match with non-sigfm print data, type was %d",
++                                         print_template->type);
++      return FPI_MATCH_ERROR;
++    }
++
++  SigfmImgInfo *against = g_ptr_array_index (print->prints, 0);
++  for (guint i = 0; i < print_template->prints->len; i++)
++    {
++      SigfmImgInfo *pinfo = g_ptr_array_index (print_template->prints, i);
++      int score = sigfm_match_score (pinfo, against);
++      if (score < 0)
++        {
++          *error = fpi_device_error_new_msg (FP_DEVICE_ERROR_DATA_INVALID,
++                                             "error in sigfm_match_score");
++          return FPI_MATCH_ERROR;
++        }
++      fp_dbg ("sigfm score %d/%d", score, score_threshold);
++      if (score >= score_threshold)
++        return FPI_MATCH_SUCCESS;
++    }
++  return FPI_MATCH_FAIL;
++}
++
+ /**
+  * fpi_print_generate_user_id:
+  * @print: #FpPrint to generate the ID for
+diff --git a/libfprint/fpi-print.h b/libfprint/fpi-print.h
+index 773407d8..46590540 100644
+--- a/libfprint/fpi-print.h
++++ b/libfprint/fpi-print.h
+@@ -16,6 +16,7 @@ typedef enum {
+   FPI_PRINT_UNDEFINED = 0,
+   FPI_PRINT_RAW,
+   FPI_PRINT_NBIS,
++  FPI_PRINT_SIGFM,
+ } FpiPrintType;
+ 
+ /**
+@@ -50,6 +51,11 @@ FpiMatchResult fpi_print_bz3_match (FpPrint *print_template,
+                                     gint     bz3_threshold,
+                                     GError **error);
+ 
++FpiMatchResult fpi_print_sigfm_match (FpPrint *print_template,
++                                      FpPrint *print,
++                                      gint     score_threshold,
++                                      GError **error);
++
+ /* Helpers to encode metadata into user ID strings. */
+ gchar *  fpi_print_generate_user_id (FpPrint *print);
+ gboolean fpi_print_fill_from_user_id (FpPrint    *print,
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index f11533ca..ae1db494 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -123,6 +123,12 @@ driver_sources = {
+     'elanmoc' : files('drivers/elanmoc/elanmoc.c'),
+     'elanspi' : files('drivers/elanspi.c'),
+     'nb1010' : files('drivers/nb1010.c'),
++    'betterlife347d' : files(
++        'drivers/betterlife347d/betterlife347d.c',
++        'drivers/betterlife347d/betterlife347d-proto.c',
++        'drivers/betterlife347d/sm3.c',
++        'drivers/betterlife347d/sm4.c',
++    ),
+     'virtual_image' : files('drivers/virtual-image.c'),
+     'virtual_device' : files('drivers/virtual-device.c'),
+     'virtual_device_storage' : files('drivers/virtual-device-storage.c'),
+@@ -218,6 +224,8 @@ deps = [
+     mathlib_dep,
+ ] + optional_deps
+ 
++subdir('sigfm')
++
+ # These are empty and only exist so that the include directories are created
+ # in the build tree. This silences a build time warning.
+ subdir('nbis/include')
+@@ -241,13 +249,14 @@ libnbis = static_library('nbis',
+     ]),
+     install: false)
+ 
++
+ libfprint_private = static_library('fprint-private',
+     sources: [
+         fpi_enums,
+         libfprint_private_sources,
+     ],
+     dependencies: deps,
+-    link_with: libnbis,
++    link_with: [libnbis, libsigfm],
+     install: false)
+ 
+ libfprint_drivers = static_library('fprint-drivers',
+@@ -291,6 +300,9 @@ libfprint_dep = declare_dependency(link_with: libfprint,
+ install_headers(['fprint.h'] + libfprint_public_headers,
+     subdir: versioned_libname
+ )
++install_headers(['sigfm/sigfm.h'],
++  subdir: versioned_libname + '/sigfm'
++)
+ 
+ libfprint_private_dep = declare_dependency(
+     include_directories: include_directories('.'),
+diff --git a/libfprint/sigfm/binary.hpp b/libfprint/sigfm/binary.hpp
+new file mode 100644
+index 00000000..5e149605
+--- /dev/null
++++ b/libfprint/sigfm/binary.hpp
+@@ -0,0 +1,229 @@
++// SIGFM algorithm for libfprint
++
++// Copyright (C) 2022 Matthieu CHARETTE <matthieu.charette@gmail.com>
++// Copyright (c) 2022 Natasha England-Elbro <natasha@natashaee.me>
++// Copyright (c) 2022 Timur Mangliev <tigrmango@gmail.com>
++//
++// SPDX-License-Identifier: LGPL-2.1-or-later
++//
++
++#pragma once
++
++#include "opencv2/core/mat.hpp"
++#include <array>
++#include <cstring>
++#include <stdexcept>
++#include <type_traits>
++#include <vector>
++
++namespace bin {
++using byte = unsigned char;
++
++class stream;
++
++template<typename T, typename EnableIf = void>
++struct serializer : public std::false_type {
++    void serialize(const T& m, stream& out);
++};
++
++template<typename T, typename EnableIf = void>
++struct deserializer : public std::false_type {
++    T deserialize(stream& in);
++};
++class stream {
++public:
++    stream() = default;
++
++    template<
++        typename Iter,
++        std::enable_if_t<std::is_same_v<typename std::iterator_traits<
++                                            std::decay_t<Iter>>::value_type,
++                                        byte>,
++                         bool> = true>
++    stream(Iter begin, Iter end) : store_{begin, end}
++    {
++    }
++
++    template<typename T, std::enable_if_t<serializer<T>::value, bool> = true>
++    constexpr stream& operator<<(T v)
++    {
++        serializer<T>::serialize(v, *this);
++        return *this;
++    }
++
++    template<typename T, std::enable_if_t<deserializer<T>::value, bool> = true>
++    constexpr stream& operator>>(T& v)
++    {
++        v = deserializer<T>::deserialize(*this);
++        return *this;
++    }
++
++    template<
++        typename Iter,
++        std::enable_if_t<std::is_same_v<typename std::iterator_traits<
++                                            std::decay_t<Iter>>::value_type,
++                                        byte>,
++                         bool> = true>
++    constexpr stream& write(Iter&& begin, Iter&& end)
++    {
++        std::copy(std::forward<Iter>(begin), std::forward<Iter>(end),
++                  std::back_inserter(store_));
++        return *this;
++    }
++
++    template<typename T, std::enable_if_t<serializer<T>::value, bool> = true>
++    stream& serialize(const T& m, stream& out)
++    {
++        serializer<T>::serialize(m, out);
++        return out;
++    }
++
++    template<
++        typename Iter,
++        std::enable_if_t<std::is_same_v<typename std::iterator_traits<
++                                            std::decay_t<Iter>>::value_type,
++                                        byte>,
++                         bool> = true>
++    constexpr stream& read(Iter&& begin, Iter&& end)
++    {
++        const auto dist = std::distance(begin, end);
++        return stream::read(begin, dist);
++    }
++
++    template<
++        typename Iter,
++        std::enable_if_t<std::is_same_v<typename std::iterator_traits<
++                                            std::decay_t<Iter>>::value_type,
++                                        byte>,
++                         bool> = true>
++    constexpr stream& read(Iter&& begin, std::size_t dist)
++    {
++        if (dist > store_.size()) {
++            throw std::runtime_error{"trying to read too much from a stream. wanted: " + std::to_string(dist) + " available: " + std::to_string(store_.size())};
++        }
++        std::copy(store_.begin(), store_.begin() + dist, begin);
++        store_.erase(store_.begin(), store_.begin() + dist);
++        return *this;
++    }
++    byte* copy_buffer() const
++    {
++        byte* raw = static_cast<byte*>(malloc(store_.size()));
++        std::copy(store_.begin(), store_.end(), raw);
++        return raw;
++    }
++    std::size_t size() const { return store_.size(); }
++
++private:
++    std::vector<byte> store_;
++};
++
++template<typename T>
++struct serializer<T, std::enable_if_t<std::is_trivial_v<T>>> : public std::true_type {
++    static void serialize(T v, stream& out) {
++        using seg_store = std::array<byte, sizeof(T)>;
++        alignas(T) seg_store s = {};
++        std::memcpy(s.data(), &v, sizeof(T));
++        out.write(s.begin(), s.end());
++    }
++};
++
++
++template<typename T>
++struct deserializer<T, std::enable_if_t<std::is_trivial_v<T>>> : public std::true_type {
++    static T deserialize(stream& in) {
++        alignas(T) std::array<byte, sizeof(T)> s = {};
++        in.read(s.begin(), s.size());
++        T v;
++        std::memcpy(&v, s.data(), s.size());
++        return v;
++    }
++};
++
++
++template<>
++struct serializer<cv::Mat> : public std::true_type {
++    static void serialize(const cv::Mat& m, stream& out)
++    {
++        out << m.type() << m.rows << m.cols;
++        out.write(m.datastart, m.dataend);
++    }
++};
++
++template<>
++struct deserializer<cv::Mat> : public std::true_type {
++    static cv::Mat deserialize(stream& in)
++    {
++        int rows, cols, type;
++        in >> type >> rows >> cols;
++        cv::Mat m;
++        m.create(rows, cols, type);
++        in.read(m.data, std::distance(m.datastart, m.dataend));
++        return m;
++    }
++};
++
++template<typename T>
++struct deserializer<cv::Point_<T>> : public std::true_type {
++    static cv::Point2f deserialize(stream& in)
++    {
++        cv::Point_<T> p;
++        in >> p.x >> p.y;
++        return p;
++    }
++};
++template<typename T>
++struct serializer<cv::Point_<T>> : public std::true_type {
++    static void serialize(const cv::Point_<T>& pt, stream& out)
++    {
++        out << pt.x << pt.y;
++    }
++};
++
++template<>
++struct serializer<cv::KeyPoint> : public std::true_type {
++    static void serialize(const cv::KeyPoint& pt, stream& out)
++    {
++        out << pt.class_id << pt.angle << pt.octave << pt.response << pt.size
++            << pt.pt;
++    }
++};
++
++template<>
++struct deserializer<cv::KeyPoint> : public std::true_type {
++    static cv::KeyPoint deserialize(stream& in)
++    {
++        cv::KeyPoint pt;
++        in >> pt.class_id >> pt.angle >> pt.octave >> pt.response >> pt.size >>
++            pt.pt;
++        return pt;
++    }
++};
++
++
++template<typename T>
++struct serializer<std::vector<T>, std::enable_if_t<serializer<T>::value>> : public std::true_type {
++    static void serialize(const std::vector<T>& vs, stream& out)
++    {
++        out << static_cast<std::size_t>(vs.size());
++        std::for_each(vs.begin(), vs.end(),
++                      [&out](const auto& el) { out << el; });
++    }
++};
++
++template<typename T>
++struct deserializer<std::vector<T>, std::enable_if_t<deserializer<T>::value>> : public std::true_type {
++    static std::vector<T> deserialize(stream& in)
++    {
++        std::size_t size;
++        in >> size;
++        std::vector<T> vs;
++        vs.reserve(size);
++        for (std::size_t n = 0; n != size; ++n) {
++            T v;
++            in >> v;
++            vs.emplace_back(std::move(v));
++        }
++        return vs;
++    }
++};
++} // namespace bin
+diff --git a/libfprint/sigfm/img-info.hpp b/libfprint/sigfm/img-info.hpp
+new file mode 100644
+index 00000000..c1ef62ff
+--- /dev/null
++++ b/libfprint/sigfm/img-info.hpp
+@@ -0,0 +1,18 @@
++// SIGFM algorithm for libfprint
++
++// Copyright (C) 2022 Matthieu CHARETTE <matthieu.charette@gmail.com>
++// Copyright (c) 2022 Natasha England-Elbro <natasha@natashaee.me>
++// Copyright (c) 2022 Timur Mangliev <tigrmango@gmail.com>
++//
++// SPDX-License-Identifier: LGPL-2.1-or-later
++//
++
++#pragma once
++
++#include <opencv2/core.hpp>
++#include <vector>
++
++struct SigfmImgInfo {
++    std::vector<cv::KeyPoint> keypoints;
++    cv::Mat descriptors;
++};
+\ No newline at end of file
+diff --git a/libfprint/sigfm/meson.build b/libfprint/sigfm/meson.build
+new file mode 100644
+index 00000000..8fd08e9e
+--- /dev/null
++++ b/libfprint/sigfm/meson.build
+@@ -0,0 +1,3 @@
++sigfm_sources = ['sigfm.cpp']
++opencv = dependency('opencv4', required: true)
++libsigfm = static_library('sigfm', sigfm_sources, dependencies: [opencv])
+diff --git a/libfprint/sigfm/sigfm.cpp b/libfprint/sigfm/sigfm.cpp
+new file mode 100644
+index 00000000..bc26a33c
+--- /dev/null
++++ b/libfprint/sigfm/sigfm.cpp
+@@ -0,0 +1,208 @@
++// SIGFM algorithm for libfprint
++
++// Copyright (C) 2022 Matthieu CHARETTE <matthieu.charette@gmail.com>
++// Copyright (c) 2022 Natasha England-Elbro <natasha@natashaee.me>
++// Copyright (c) 2022 Timur Mangliev <tigrmango@gmail.com>
++//
++// SPDX-License-Identifier: LGPL-2.1-or-later
++//
++
++#include "sigfm.h"
++#include "binary.hpp"
++#include "img-info.hpp"
++
++#include "opencv2/core/persistence.hpp"
++#include "opencv2/core/types.hpp"
++#include "opencv2/features2d.hpp"
++#include "opencv2/imgcodecs.hpp"
++#include <algorithm>
++#include <cstdio>
++#include <filesystem>
++#include <fstream>
++#include <iterator>
++#include <sstream>
++#include <string>
++
++#include <opencv2/opencv.hpp>
++#include <vector>
++
++namespace bin {
++
++template<>
++struct serializer<SigfmImgInfo> : public std::true_type {
++    static void serialize(const SigfmImgInfo& info, stream& out)
++    {
++        out << info.keypoints << info.descriptors;
++    }
++};
++
++template<>
++struct deserializer<SigfmImgInfo> : public std::true_type {
++    static SigfmImgInfo deserialize(stream& in)
++    {
++        SigfmImgInfo info;
++        in >> info.keypoints >> info.descriptors;
++        return info;
++    }
++};
++} // namespace bin
++
++namespace {
++constexpr auto distance_match = 0.75;
++constexpr auto length_match = 0.05;
++constexpr auto angle_match = 0.05;
++constexpr auto min_match = 5;
++struct match {
++    cv::Point2i p1;
++    cv::Point2i p2;
++    match(cv::Point2i ip1, cv::Point2i ip2) : p1{ip1}, p2{ip2} {}
++    match() : p1{cv::Point2i(0, 0)}, p2{cv::Point2i(0, 0)} {}
++    bool operator==(const match& right) const
++    {
++        return std::tie(this->p1, this->p2) == std::tie(right.p1, right.p2);
++    }
++    bool operator<(const match& right) const
++    {
++        return (this->p1.y < right.p1.y) ||
++               ((this->p1.y < right.p1.y) && this->p1.x < right.p1.x);
++    }
++};
++struct angle {
++    double cos;
++    double sin;
++    match corr_matches[2];
++    angle(double cos_, double sin_, match m1, match m2)
++        : cos{cos_}, sin{sin_}, corr_matches{m1, m2}
++    {
++    }
++};
++} // namespace
++
++SigfmImgInfo* sigfm_copy_info(SigfmImgInfo* info) { return new SigfmImgInfo{*info}; }
++
++int sigfm_keypoints_count(SigfmImgInfo* info) { return info->keypoints.size(); }
++unsigned char* sigfm_serialize_binary(SigfmImgInfo* info, int* outlen)
++{
++    bin::stream s;
++    s << *info;
++    *outlen = s.size();
++    return s.copy_buffer();
++}
++
++SigfmImgInfo* sigfm_deserialize_binary(const unsigned char* bytes, int len)
++{
++    try {
++        bin::stream s{bytes, bytes + len};
++        auto info = std::make_unique<SigfmImgInfo>();
++        s >> *info;
++        return info.release();
++    }
++    catch (const std::exception&) {
++        return nullptr;
++    }
++}
++
++SigfmImgInfo* sigfm_extract(const SigfmPix* pix, int width, int height)
++{
++    try {
++        cv::Mat img;
++        img.create(height, width, CV_8UC1);
++        std::memcpy(img.data, pix, width * height);
++        const auto roi = cv::Mat::ones(cv::Size{img.size[1], img.size[0]}, CV_8UC1);
++        std::vector<cv::KeyPoint> pts;
++
++        cv::Mat descs;
++        cv::SIFT::create()->detectAndCompute(img, roi, pts, descs);
++
++        auto* info = new SigfmImgInfo{pts, descs};
++        return info;
++    } catch(...) {
++        return nullptr;
++    }
++}
++
++int sigfm_match_score(SigfmImgInfo* frame, SigfmImgInfo* enrolled)
++{
++    try {
++        std::vector<std::vector<cv::DMatch>> points;
++        auto bfm = cv::BFMatcher::create();
++        bfm->knnMatch(frame->descriptors, enrolled->descriptors, points, 2);
++        std::set<match> matches_unique;
++        int nb_matched = 0;
++        for (const auto& pts : points) {
++            if (pts.size() < 2) {
++                continue;
++            }
++            const cv::DMatch& match_1 = pts.at(0);
++            if (match_1.distance < distance_match * pts.at(1).distance) {
++                matches_unique.emplace(
++                    match{frame->keypoints.at(match_1.queryIdx).pt,
++                          enrolled->keypoints.at(match_1.trainIdx).pt});
++                nb_matched++;
++            }
++        }
++        if (nb_matched < min_match) {
++            return 0;
++        }
++        std::vector<match> matches{matches_unique.begin(),
++                                   matches_unique.end()};
++
++        std::vector<angle> angles;
++        for (std::size_t j = 0; j < matches.size(); j++) {
++            match match_1 = matches[j];
++            for (std::size_t k = j + 1; k < matches.size(); k++) {
++                match match_2 = matches[k];
++
++                int vec_1[2] = {match_1.p1.x - match_2.p1.x,
++                                match_1.p1.y - match_2.p1.y};
++                int vec_2[2] = {match_1.p2.x - match_2.p2.x,
++                                match_1.p2.y - match_2.p2.y};
++
++                double length_1 = sqrt(pow(vec_1[0], 2) + pow(vec_1[1], 2));
++                double length_2 = sqrt(pow(vec_2[0], 2) + pow(vec_2[1], 2));
++
++                if (1 - std::min(length_1, length_2) /
++                            std::max(length_1, length_2) <=
++                    length_match) {
++
++                    double product = length_1 * length_2;
++                    angles.emplace_back(angle(
++                        M_PI / 2 +
++                            asin((vec_1[0] * vec_2[0] + vec_1[1] * vec_2[1]) /
++                                 product),
++                        acos((vec_1[0] * vec_2[1] - vec_1[1] * vec_2[0]) /
++                             product),
++                        match_1, match_2));
++                }
++            }
++        }
++
++        if (angles.size() < min_match) {
++            return 0;
++        }
++
++        int count = 0;
++        for (std::size_t j = 0; j < angles.size(); j++) {
++            angle angle_1 = angles[j];
++            for (std::size_t k = j + 1; k < angles.size(); k++) {
++                angle angle_2 = angles[k];
++
++                if (1 - std::min(angle_1.sin, angle_2.sin) /
++                                std::max(angle_1.sin, angle_2.sin) <=
++                        angle_match &&
++                    1 - std::min(angle_1.cos, angle_2.cos) /
++                                std::max(angle_1.cos, angle_2.cos) <=
++                        angle_match) {
++
++                    count += 1;
++                }
++            }
++        }
++        return count;
++    }
++    catch (...) {
++        return -1;
++    }
++}
++
++void sigfm_free_info(SigfmImgInfo* info) { delete info; }
+diff --git a/libfprint/sigfm/sigfm.h b/libfprint/sigfm/sigfm.h
+new file mode 100644
+index 00000000..23884a7f
+--- /dev/null
++++ b/libfprint/sigfm/sigfm.h
+@@ -0,0 +1,91 @@
++// SIGFM algorithm for libfprint
++
++// Copyright (C) 2022 Matthieu CHARETTE <matthieu.charette@gmail.com>
++// Copyright (c) 2022 Natasha England-Elbro <natasha@natashaee.me>
++// Copyright (c) 2022 Timur Mangliev <tigrmango@gmail.com>
++//
++// SPDX-License-Identifier: LGPL-2.1-or-later
++//
++
++#pragma once
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++typedef unsigned char       SigfmPix;
++/**
++ * @brief Contains information used by the sigfm algorithm for matching
++ * @details Get one from sigfm_extract() and make sure to clean it up with sigfm_free_info()
++ * @struct SigfmImgInfo
++ */
++typedef struct SigfmImgInfo SigfmImgInfo;
++
++/**
++ * @brief Extracts information from an image for later use sigfm_match_score
++ *
++ * @param pix Pixels of the image must be width * height in length
++ * @param width Width of the image
++ * @param height Height of the image
++ * @return SigfmImgInfo* Info that can be used with the API
++ */
++SigfmImgInfo * sigfm_extract (const SigfmPix * pix,
++                              int              width,
++                              int              height);
++
++/**
++ * @brief Destroy an SigfmImgInfo
++ * @warning Call this instead of free() or you will get UB!
++ * @param info SigfmImgInfo to destroy
++ */
++void sigfm_free_info (SigfmImgInfo * info);
++
++/**
++ * @brief Score how closely a frame matches another
++ *
++ * @param frame Print to be checked
++ * @param enrolled Canonical print to verify against
++ * @return int Score of how closely they match, values <0 indicate error, 0 means always reject
++ */
++int sigfm_match_score (SigfmImgInfo * frame,
++                       SigfmImgInfo * enrolled);
++
++/**
++ * @brief Serialize an image info for storage
++ *
++ * @param info SigfmImgInfo to store
++ * @param outlen output: Length of the returned byte array
++ * @return unsigned* char byte array for storage, should be free'd by the callee
++ */
++unsigned char * sigfm_serialize_binary (SigfmImgInfo * info,
++                                        int          * outlen);
++/**
++ * @brief Deserialize an SigfmImgInfo from storage
++ *
++ * @param bytes Byte array to deserialize from
++ * @param len Length of the byte array
++ * @return SigfmImgInfo* Deserialized info, or NULL if deserialization failed
++ */
++SigfmImgInfo * sigfm_deserialize_binary (const unsigned char * bytes,
++                                         int                   len);
++
++/**
++ * @brief Keypoints for an image. Low keypoints generally means the image is
++ * low quality for matching
++ *
++ * @param info
++ * @return int
++ */
++
++int sigfm_keypoints_count (SigfmImgInfo * info);
++
++/**
++ * @brief Copy an SigfmImgInfo
++ *
++ * @param info Source of copy
++ * @return SigfmImgInfo* Newly allocated and copied version of info
++ */
++SigfmImgInfo * sigfm_copy_info (SigfmImgInfo * info);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/meson.build b/meson.build
+index ab09dc1d..a24b5446 100644
+--- a/meson.build
++++ b/meson.build
+@@ -5,6 +5,7 @@ project('libfprint', [ 'c', 'cpp' ],
+         'buildtype=debugoptimized',
+         'warning_level=1',
+         'c_std=gnu99',
++        'cpp_std=c++17',
+     ],
+     meson_version: '>= 0.62.0')
+ 
+@@ -142,6 +143,7 @@ drivers_info = {
+     'upekts': {},
+     'goodixmoc': {},
+     'nb1010': {},
++    'betterlife347d': { 'helper': ['openssl'] },
+     'fpcmoc': {},
+     'realtek': {},
+     'focaltech_moc': {},
